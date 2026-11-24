@@ -174,7 +174,8 @@ def summarize(samples, combinations):
         entry = {key: median(row[key] for row in group if row[key] is not None)
                  for key in keys if any(row[key] is not None for row in group)}
         summary.append(dict(geometry=geometry, case=case, format=group[0]["format"],
-                            layout=group[0]["layout"], hdf5_write_path=group[0]["hdf5_write_path"], target_fps=rate,
+                            layout=group[0]["layout"], hdf5_write_path=group[0]["hdf5_write_path"],
+                            zarr_write_path=group[0]["zarr_write_path"], target_fps=rate,
                             writers=writers, missing_frames=sum(row["missing_frames"] for row in group),
                             **entry))
     return summary
@@ -192,7 +193,7 @@ def plot_matrix(path, summary, groups):
             rows = [row for row in summary if row["case"] == case]
             fmt = "HDF5" if rows[0]["format"] == "nexus" else "Zarr"
             layout = "frames" if rows[0]["layout"] == "acquisition" else rows[0]["layout"]
-            write_path = rows[0]["hdf5_write_path"]
+            write_path = rows[0]["hdf5_write_path"] or rows[0]["zarr_write_path"]
             label = f"{fmt} · {layout} · {write_path}" if write_path else f"{fmt} · {layout}"
             ax.bar(xs + (index - 1.5) * .18, [row[key] for row in rows], width=.17,
                    color=color, label=label)
@@ -226,6 +227,12 @@ def report(output, setup, summary):
                       "File cases have HDF5 build the part directly in a temporary file on the destination mount. "
                       "Both use the same rename and publication marker protocol. "
                       "For file cases, `write_seconds` includes building the HDF5 part.", ""]
+    elif setup["compare_zarr_writes"]:
+        comparison = ["Memory cases build each Zarr shard in a separate memory store. "
+                      "File cases assign complete shards to the destination Zarr array. "
+                      "Both use atomic shard replacement and emit a marker after the shard is ready. "
+                      "With fsync enabled, both sync the shard and its parent directories before publishing the marker. "
+                      "For file cases, `write_seconds` includes encoding the shard.", ""]
     lines = ["# Detector write matrix", "",
              f"{passes} at each setting, with a fresh process and fresh output per trial. "
              f"Destination was **{filesystem}**, staged source **{scratch}**. "
@@ -290,8 +297,11 @@ def main():
                         help="synthetic chunk and file/shard sizes in uncompressed MiB (repeatable)")
     parser.add_argument("--compression", choices=("gzip", "none"),
                         help="override output compression for all cases")
-    parser.add_argument("--compare-hdf5-writes", action="store_true",
-                        help="compare HDF5 memory and file output for both layouts (default: uncompressed, fsync on)")
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument("--compare-hdf5-writes", action="store_true",
+                            help="compare HDF5 memory and file output for both layouts (uncompressed, fsync on)")
+    comparison.add_argument("--compare-zarr-writes", action="store_true",
+                            help="compare Zarr memory and filesystem stores for both layouts (uncompressed, fsync on)")
     parser.add_argument("--no-sync", action="store_true", help="measure buffered writes with fsync disabled")
     parser.add_argument("--rates", type=integer_list, default=(500, 4000), help="comma-separated source rates")
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
@@ -315,9 +325,10 @@ def main():
                 raise ValueError("a verified four-case experiment is required")
             raw = experiment["raw"]
             chunks = {row["case"]: row["raw_chunks"] for row in experiment["case_results"]}
-        if args.compare_hdf5_writes:
+        if args.compare_hdf5_writes or args.compare_zarr_writes:
             raw = dict(raw, compression="none", sync=True)
-            cases = {f"{case}-{path}": (case, path) for case in ("A", "B") for path in ("memory", "file")}
+            selected = ("A", "B") if args.compare_hdf5_writes else ("C", "D")
+            cases = {f"{case}-{path}": (case, path) for case in selected for path in ("memory", "file")}
         else:
             cases = {case: (case, None) for case in CASES}
         if args.compression is not None:
@@ -343,6 +354,7 @@ def main():
                      raw=dict(raw, angle_block=first_geometry["angle_block"]),
                      raw_chunks=first_geometry["raw_chunks"], geometries=geometries,
                      compare_hdf5_writes=args.compare_hdf5_writes,
+                     compare_zarr_writes=args.compare_zarr_writes,
                      zarr_concurrency=raw.get("zarr_concurrency", zarr.config.get("async.concurrency")),
                      cpu_affinity=sorted(os.sched_getaffinity(0)), repeats=args.repeats)
         samples, partitions, timeline = [], [], []
@@ -358,21 +370,25 @@ def main():
                     order = combinations if repeat % 2 else combinations[::-1]
                     for index, (geometry_label, rate, writers, case_label) in enumerate(order, 1):
                         case, write_path = cases[case_label]
+                        kind, layout = CASES[case]
+                        hdf5_path = write_path if kind == "nexus" else None
+                        zarr_path = write_path if kind == "zarr" else None
                         geometry = geometries[geometry_label]
                         label = f"pass{repeat}-{geometry_label.replace('/', '-')}mib-{rate}fps-{writers}writers-{case_label}"
                         settings = dict(raw, fps=rate, workers=writers, overflow="block",
                                         angle_block=geometry["angle_block"], raw_chunks=geometry["raw_chunks"][case])
                         if write_path:
-                            settings["hdf5_write_path"] = write_path
+                            path_key = "hdf5_write_path" if kind == "nexus" else "zarr_write_path"
+                            settings[path_key] = write_path
                         with TemporaryDirectory(prefix=f"{label}-", dir=output) as target:
                             sample, published, phase = pool.submit(
                                 trial, Path(target), scratch, case, settings, label, args.gpfs_counter_command).result()
-                        kind, layout = CASES[case]
                         if layout == "bricks" and raw.get("detector_bricks") == "sinogram":
                             layout = "sinogram"
                         samples.append(dict(trial=label, repeat=repeat, geometry=geometry_label,
                                             chunk_mib=geometry["chunk_mib"], partition_mib=geometry["partition_mib"],
-                                            target_fps=rate, writers=writers, case=case_label, hdf5_write_path=write_path,
+                                            target_fps=rate, writers=writers, case=case_label,
+                                            hdf5_write_path=hdf5_path, zarr_write_path=zarr_path,
                                             format=kind, layout=layout, **sample))
                         partitions.extend(dict(trial=label, **row) for row in published)
                         timeline.append(phase)

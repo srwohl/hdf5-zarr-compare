@@ -23,11 +23,12 @@ class ExperimentTests(unittest.TestCase):
             source.mkdir()
             np.save(source / "flat_0.npy", np.full((4, 4), 25, dtype=np.float32))
             np.save(source / "dark_0.npy", np.zeros((4, 4), dtype=np.float32))
-            for kind, path in (("nexus", "memory"), ("nexus", "file"), ("zarr", None)):
+            for kind, path in (("nexus", "memory"), ("nexus", "file"), ("zarr", None), ("zarr", "file")):
                 with self.subTest(kind=kind, path=path):
                     output = root / (f"{kind}-{path}" if path else kind)
                     output.mkdir()
-                    settings = dict(config, hdf5_write_path=path) if path else config
+                    path_key = "hdf5_write_path" if kind == "nexus" else "zarr_write_path"
+                    settings = dict(config, **{path_key: path}) if path else config
                     writer = replay.RawWriter(output, settings, kind, source)
                     writer.publish(0, [frames], [])
                     published = output / "publications"

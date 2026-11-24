@@ -23,6 +23,11 @@ def sync_directory(path):
         os.close(fd)
 
 
+def sync_file(path):
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
 def atomic_payload(path, payload, sync):
     """Publish bytes from a private buffer. Return write and fsync wall times."""
     started = time.perf_counter()
@@ -46,7 +51,8 @@ class RawWriter:
         self.chunks = tuple(config["raw_chunks"])
         self.sync = config["sync"]
         self.compression = config["compression"]
-        self.hdf5_write_path = config.get("hdf5_write_path", "memory")
+        path_key = "hdf5_write_path" if kind == "nexus" else "zarr_write_path"
+        self.write_path = config.get(path_key, "memory")
         self.publications = directory / "publications"
         self.publications.mkdir()
         if kind == "nexus":
@@ -55,6 +61,7 @@ class RawWriter:
                 (self.root_path / f"tile_{tile}").mkdir(parents=True)
             tiled.create_raw_master(directory, config, raw_source)
         else:
+            self.zarr_arrays = []
             self.root_path = directory / "raw.zarr"
             root = zarr.open_group(str(self.root_path), mode="w", zarr_format=3)
             root.attrs.update(config)
@@ -65,6 +72,8 @@ class RawWriter:
                 array = self.zarr_array(group, (len(config["angles_deg"]), width, width))
                 array.attrs["units"] = "counts"
                 self.key = array.metadata.encode_chunk_key
+                if self.write_path == "file":
+                    self.zarr_arrays.append(array)
                 for name in ("flat", "dark"):
                     data = np.load(raw_source / f"{name}_{tile}.npy")
                     group.create_array(name, data=data, compressors=None)
@@ -88,7 +97,7 @@ class RawWriter:
             group = zarr.open_group(store=zarr.storage.MemoryStore(memory), mode="w", zarr_format=3)
             self.zarr_array(group, self.shard)[:] = values
             buffer = memory.get(f"data/{self.key((0, 0, 0))}")
-            path = self.root_path / f"tile_{tile}/data" / self.key((start // self.shard[0], 0, 0))
+            path = self.zarr_shard_path(tile, start)
             return path, None if buffer is None else buffer.as_buffer_like()
         path = self.nexus_part_path(tile, start)
         with h5py.File(str(path), "w", driver="core", backing_store=False) as handle:
@@ -98,6 +107,9 @@ class RawWriter:
 
     def nexus_part_path(self, tile, start):
         return self.root_path / f"tile_{tile}/part_{start}.nxs"
+
+    def zarr_shard_path(self, tile, start):
+        return self.root_path / f"tile_{tile}/data" / self.key((start // self.shard[0], 0, 0))
 
     def write_nexus_dataset(self, handle, values):
         options = {"compression": "gzip", "compression_opts": 1} if self.compression == "gzip" else {}
@@ -116,18 +128,36 @@ class RawWriter:
         size = temporary.stat().st_size
         written = time.perf_counter()
         if self.sync:
-            with temporary.open("r+b") as handle:
-                os.fsync(handle.fileno())
+            sync_file(temporary)
         flushed = time.perf_counter()
         temporary.replace(path)
         return size, written - started + time.perf_counter() - flushed, flushed - written if self.sync else 0.
 
+    def write_zarr_file(self, tile, start, path, values):
+        started = time.perf_counter()
+        self.zarr_arrays[tile][start:start + self.shard[0], :, :] = values
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            # The codec can represent a fill-only shard by the absence of its key.
+            if values.any():
+                raise
+            return 0, time.perf_counter() - started, 0.
+        written = time.perf_counter()
+        if self.sync:
+            sync_file(path)
+        return size, written - started, time.perf_counter() - written if self.sync else 0.
+
     def publish(self, start, frames, missing):
         encode_seconds = write_seconds = sync_seconds = payload_bytes = 0
         for tile, values in enumerate(frames):
-            if self.kind == "nexus" and self.hdf5_write_path == "file":
-                path = self.nexus_part_path(tile, start)
-                size, written, synced = self.write_nexus_file(path, values)
+            if self.write_path == "file":
+                if self.kind == "nexus":
+                    path = self.nexus_part_path(tile, start)
+                    size, written, synced = self.write_nexus_file(path, values)
+                else:
+                    path = self.zarr_shard_path(tile, start)
+                    size, written, synced = self.write_zarr_file(tile, start, path, values)
             else:
                 started = time.perf_counter()
                 path, payload = self.pack(tile, start, values)
@@ -142,7 +172,7 @@ class RawWriter:
             payload_bytes += size
             write_seconds += written
             sync_seconds += synced
-            if self.sync:
+            if self.sync and size:
                 started = time.perf_counter()
                 for parent in path.parents:
                     sync_directory(parent)

@@ -218,6 +218,22 @@ It includes final sync and worker teardown. In `samples.csv`, `write_seconds`
 includes HDF5 file construction for the file path. For the memory path, look
 at `encode_seconds` and `write_seconds` together. Writer times can overlap.
 
+#### Compare Zarr memory and file writes
+
+The memory path builds each shard in a temporary memory store. The file
+path writes complete shards through the destination Zarr array and its
+filesystem store. It uses Zarr's usual shard encoding and buffered filesystem
+I/O. Both sync each shard and its parent directories before publishing a
+marker. The preset uses uncompressed frames and reverses trial order on
+the second pass.
+
+```bash
+./run-hpc.sh --config configs/zarr-write-paths.toml
+```
+
+Compare **Full-run GB/s** within C (acquisition chunks) and within D (bricks).
+In `samples.csv`, `write_seconds` includes shard encoding for the file path.
+
 ### See how parallel reads overlap
 
 Replay the same recorded detector selections with one and two readers and

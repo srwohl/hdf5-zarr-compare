@@ -2,6 +2,7 @@
 import argparse
 import itertools
 import json
+from math import prod
 import os
 from pathlib import Path
 from shutil import disk_usage
@@ -15,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import zarr
 
+from demo import MIB
 from experiment import CASES, Timeline, footprint, mount_info, save_csv, save_json, verify_raw
 from profile_raw_reads import fresh_reader_pool as fresh_trial_pool
 from replay import RawWriter, gb_per_second, run_replay
@@ -29,6 +31,16 @@ def integer_list(value):
         return values
     except ValueError:
         raise argparse.ArgumentTypeError("expected comma-separated distinct positive integers")
+
+
+def geometry_pair(value):
+    try:
+        chunk, partition = map(int, value.split(":"))
+        if min(chunk, partition) <= 0:
+            raise ValueError
+        return chunk, partition
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected CHUNK_MIB:PARTITION_MIB with positive integers")
 
 
 def stage_frames(directory, scratch, raw):
@@ -60,6 +72,35 @@ def synthetic_config(width, frames):
     chunks = {case: (1, width, width) if layout == "acquisition" else (block, width // 2, width // 2)
               for case, (_, layout) in CASES.items()}
     return raw, chunks
+
+
+def storage_geometry(raw, chunks, pair):
+    width, block = raw["tile"], raw["angle_block"]
+    frame_bytes = 2 * width**2
+    if pair is not None:
+        chunk_bytes, partition_bytes = (value * MIB for value in pair)
+        block, remainder = divmod(partition_bytes, frame_bytes)
+        if remainder or not block or len(raw["angles_deg"]) % block:
+            raise ValueError(f"geometry {pair[0]}:{pair[1]} needs whole frames per partition "
+                             "and an integral number of partitions in the run")
+        brick_depth, remainder = divmod(chunk_bytes, frame_bytes // 4)
+        if remainder or not brick_depth or block % brick_depth:
+            raise ValueError(f"geometry {pair[0]}:{pair[1]} must fit quarter-frame chunks "
+                             "evenly into each partition")
+        if chunk_bytes < frame_bytes:
+            rows, remainder = divmod(chunk_bytes, 2 * width)
+            if remainder or not rows or width % rows:
+                raise ValueError(f"geometry {pair[0]}:{pair[1]} must divide each frame into whole row strips")
+            acquisition = (1, rows, width)
+        else:
+            depth, remainder = divmod(chunk_bytes, frame_bytes)
+            if remainder or block % depth:
+                raise ValueError(f"geometry {pair[0]}:{pair[1]} must divide the partition into whole-frame chunks")
+            acquisition = (depth, width, width)
+        bricks = (brick_depth, width // 2, width // 2)
+        chunks = {case: acquisition if layout == "acquisition" else bricks for case, (_, layout) in CASES.items()}
+    return dict(chunk_mib=2 * prod(chunks["A"]) / MIB, partition_mib=block * frame_bytes / MIB,
+                angle_block=block, raw_chunks=chunks)
 
 
 def stage_synthetic(scratch, raw):
@@ -127,18 +168,20 @@ def summarize(samples, combinations):
             "worker_setup_seconds", "encode_seconds", "write_seconds", "sync_seconds", "raw_logical_bytes",
             "stored_files", "received_gb_s", "published_gb_s", "payload_gb_s", "setup_to_last_gb_s",
             "full_run_gb_s", "gpfs_client_write_gb_s")
-    for rate, writers, case in combinations:
-        group = [row for row in samples if (row["target_fps"], row["writers"], row["case"]) == (rate, writers, case)]
+    for geometry, rate, writers, case in combinations:
+        group = [row for row in samples
+                 if (row["geometry"], row["target_fps"], row["writers"], row["case"]) == (geometry, rate, writers, case)]
         entry = {key: median(row[key] for row in group if row[key] is not None)
                  for key in keys if any(row[key] is not None for row in group)}
-        summary.append(dict(case=case, format=group[0]["format"], layout=group[0]["layout"], target_fps=rate,
+        summary.append(dict(geometry=geometry, case=case, format=group[0]["format"],
+                            layout=group[0]["layout"], target_fps=rate,
                             writers=writers, missing_frames=sum(row["missing_frames"] for row in group),
                             **entry))
     return summary
 
 
 def plot_matrix(path, summary, groups):
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2), layout="constrained")
+    fig, axes = plt.subplots(1, 2, figsize=(max(11.5, min(25, len(groups) * 2)), 4.5), layout="constrained")
     colors = ("#4578a8", "#82a9ce", "#257e6c", "#76b7a5")
     series = (("published_gb_s", "Useful detector GB/s", "During replay"),
               ("setup_to_last_publish_seconds", "Seconds", "Writer setup to last publication"))
@@ -150,7 +193,8 @@ def plot_matrix(path, summary, groups):
             layout = "frames" if rows[0]["layout"] == "acquisition" else rows[0]["layout"]
             ax.bar(xs + (index - 1.5) * .18, [row[key] for row in rows], width=.17,
                    color=color, label=f"{fmt} · {layout}")
-        ax.set_xticks(xs, [f"{rate:g} fps\n{writers} {'writer' if writers == 1 else 'writers'}" for rate, writers in groups])
+        ax.set_xticks(xs, [f"{geometry} MiB\n{rate:g} fps\n{writers} {'writer' if writers == 1 else 'writers'}"
+                          for geometry, rate, writers in groups])
         ax.set_ylabel(ylabel)
         ax.set_title(title, loc="left")
         ax.grid(axis="y", alpha=.24)
@@ -161,7 +205,7 @@ def plot_matrix(path, summary, groups):
 
 
 def report(output, setup, summary):
-    groups = list(dict.fromkeys((row["target_fps"], row["writers"]) for row in summary))
+    groups = list(dict.fromkeys((row["geometry"], row["target_fps"], row["writers"]) for row in summary))
     plot_matrix(output / "write-matrix.png", summary, groups)
     raw = setup["raw"]
     filesystem = setup["destination_mount"].get("fstype", "unknown")
@@ -169,7 +213,6 @@ def report(output, setup, summary):
     compression = "gzip compression" if raw["compression"] == "gzip" else "uncompressed output"
     sync = "on" if raw["sync"] else "off"
     quality = "Every trial was reread and matched the source." if setup["verified"] else "At least one trial was incomplete."
-    chunk_shapes = " · ".join(f"{case} {' × '.join(map(str, shape))}" for case, shape in setup["raw_chunks"].items())
     width = raw["tile"]
     frames = len(raw["angles_deg"]) * len(raw["tile_origins_yx_px"])
     source = "synthetic counts with Poisson noise" if setup["baseline"] is None else "saved detector replay"
@@ -177,10 +220,17 @@ def report(output, setup, summary):
     lines = ["# Detector write matrix", "",
              f"{passes} at each setting, with a fresh process and fresh output per trial. "
              f"Destination was **{filesystem}**, staged source **{scratch}**. "
-             f"{compression}, fsync {sync}, {raw['angle_block']} angles per file or shard, "
+             f"{compression}, fsync {sync}, "
              f"{raw['queue_frames']} queued frames. Zarr async concurrency was {setup['zarr_concurrency']}. "
              f"All cases shared the same {len(setup['cpu_affinity'])} logical CPUs. {quality}", "",
-             f"Raw chunk dimensions in angles × detector y × detector x. {chunk_shapes}.", "",
+             "Chunk and partition sizes are uncompressed MiB. Each partition becomes one HDF5 part file or Zarr shard "
+             "per detector tile. Chunk shapes are angles × detector y × detector x.", "",
+             "| Chunk / partition MiB | Frames per partition per tile | A/C chunk shape | B/D chunk shape |",
+             "|---|---:|---|---|",
+             *[f"| {label} | {geometry['angle_block']} | "
+               f"{' × '.join(map(str, geometry['raw_chunks']['A']))} | "
+               f"{' × '.join(map(str, geometry['raw_chunks']['B']))} |"
+               for label, geometry in setup["geometries"].items()], "",
              "The replay source pauses when the bounded queue fills. Sustained received rate and blocked time "
              "show how closely the writer kept up with the configured source rate. "
              "The setup-to-last clock starts before initializing the writer and ends at the last visible marker.", "",
@@ -190,17 +240,17 @@ def report(output, setup, summary):
              "or Zarr shard bytes handed to the filesystem during replay. Setup-inclusive GB/s counts useful "
              "bytes from writer setup through last publication.", "",
              "![Writer scaling and time to last publication](write-matrix.png)", "",
-             "| Target fps | Writers | Case | Format / layout | Received fps | Published fps | "
-             "Useful GB/s | Payload GB/s | Setup-inclusive GB/s | Blocked s | P95 ms | "
+             "| Chunk / partition MiB | Target fps | Writers | Case | Format / layout | Received fps | Published fps | "
+             "Useful GB/s | Payload GB/s | Setup-inclusive GB/s | Raw files | Blocked s | P95 ms | "
              "Setup to first s | Setup to last s | Missing |",
-             "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for row in summary:
         fmt = "HDF5" if row["format"] == "nexus" else "Zarr"
         latency = row.get("publish_p95_ms", float("nan"))
-        lines.append(f"| {row['target_fps']} | {row['writers']} | {row['case']} | {fmt} / {row['layout']} | "
+        lines.append(f"| {row['geometry']} | {row['target_fps']} | {row['writers']} | {row['case']} | {fmt} / {row['layout']} | "
                      f"{row['sustained_received_fps']:.0f} | {row['sustained_published_fps']:.0f} | "
                      f"{row['published_gb_s']:.3f} | {row['payload_gb_s']:.3f} | {row['setup_to_last_gb_s']:.3f} | "
-                     f"{row['blocked_seconds']:.3f} | {latency:.0f} | "
+                     f"{row['stored_files']:g} | {row['blocked_seconds']:.3f} | {latency:.0f} | "
                      f"{row['setup_to_first_publish_seconds']:.3f} | "
                      f"{row['setup_to_last_publish_seconds']:.3f} | {row['missing_frames']} |")
     gpfs = [row for row in summary if "gpfs_client_write_gb_s" in row]
@@ -208,9 +258,10 @@ def report(output, setup, summary):
         lines += ["", "## GPFS client write counters", "",
                   "Client throughput uses the sampled byte delta over the full acquisition phase. "
                   "NSD counters provide server-side storage traffic.", "",
-                  "| Target fps | Writers | Case | Client write GB/s |", "|---:|---:|---|---:|"]
+                  "| Chunk / partition MiB | Target fps | Writers | Case | Client write GB/s |", "|---|---:|---:|---|---:|"]
         for row in gpfs:
-            lines.append(f"| {row['target_fps']} | {row['writers']} | {row['case']} | {row['gpfs_client_write_gb_s']:.3f} |")
+            lines.append(f"| {row['geometry']} | {row['target_fps']} | {row['writers']} | {row['case']} | "
+                         f"{row['gpfs_client_write_gb_s']:.3f} |")
     lines += ["", "Times and rates are medians across trials. P95 is the median of the within-trial frame P95s. "
               "Encode, write and fsync times in the CSV are summed over workers and can overlap. "
               "The full acquisition duration also includes final synchronization and worker teardown.", "",
@@ -225,8 +276,11 @@ def main():
     parser.add_argument("output", type=Path, help="new write matrix directory on the filesystem under test")
     parser.add_argument("--detector-size", type=int, metavar="PIXELS", help="synthetic square detector width in pixels")
     parser.add_argument("--frames", type=int, help="synthetic frame count (default: 256, multiple of 4)")
+    parser.add_argument("--geometry", type=geometry_pair, action="append", metavar="CHUNK_MIB:PARTITION_MIB",
+                        help="synthetic chunk and file/shard sizes in uncompressed MiB (repeatable)")
     parser.add_argument("--compression", choices=("gzip", "none"),
                         help="override output compression for all cases")
+    parser.add_argument("--no-sync", action="store_true", help="measure buffered writes with fsync disabled")
     parser.add_argument("--rates", type=integer_list, default=(500, 4000), help="comma-separated source rates")
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
     parser.add_argument("--repeats", type=int, default=2)
@@ -242,8 +296,8 @@ def main():
         if directory is None:
             raw, chunks = synthetic_config(args.detector_size, args.frames if args.frames is not None else 256)
         else:
-            if args.frames is not None:
-                raise ValueError("--frames requires --detector-size")
+            if args.frames is not None or args.geometry:
+                raise ValueError("--frames and --geometry require --detector-size")
             experiment = json.loads((directory / "experiment.json").read_text())
             if not experiment["verified"]:
                 raise ValueError("a verified four-case experiment is required")
@@ -251,15 +305,26 @@ def main():
             chunks = {row["case"]: row["raw_chunks"] for row in experiment["case_results"]}
         if args.compression is not None:
             raw = dict(raw, compression=args.compression)
-        if max(args.writers) > len(raw["angles_deg"]) // raw["angle_block"]:
-            raise ValueError("writer count exceeds available angle blocks")
+        if args.no_sync:
+            raw = dict(raw, sync=False)
+        geometries = {}
+        for pair in args.geometry or (None,):
+            geometry = storage_geometry(raw, chunks, pair)
+            label = f"{geometry['chunk_mib']:g}/{geometry['partition_mib']:g}"
+            if label in geometries:
+                raise ValueError(f"duplicate geometry {label}")
+            if max(args.writers) > len(raw["angles_deg"]) // geometry["angle_block"]:
+                raise ValueError(f"writer count exceeds available angle blocks for geometry {label}")
+            geometries[label] = geometry
         if args.scratch:
             args.scratch.mkdir(parents=True, exist_ok=True)
         output = args.output.resolve()
         output.mkdir(parents=True, exist_ok=False)
-        combinations = list(itertools.product(args.rates, args.writers, CASES))
-        setup = dict(baseline=str(directory) if directory else None, destination_mount=mount_info(output), raw=raw,
-                     raw_chunks=chunks,
+        combinations = list(itertools.product(geometries, args.rates, args.writers, CASES))
+        first_geometry = next(iter(geometries.values()))
+        setup = dict(baseline=str(directory) if directory else None, destination_mount=mount_info(output),
+                     raw=dict(raw, angle_block=first_geometry["angle_block"]),
+                     raw_chunks=first_geometry["raw_chunks"], geometries=geometries,
                      zarr_concurrency=raw.get("zarr_concurrency", zarr.config.get("async.concurrency")),
                      cpu_affinity=sorted(os.sched_getaffinity(0)), repeats=args.repeats)
         samples, partitions, timeline = [], [], []
@@ -273,16 +338,20 @@ def main():
             with fresh_trial_pool() as pool:
                 for repeat in range(1, args.repeats + 1):
                     order = combinations if repeat % 2 else combinations[::-1]
-                    for index, (rate, writers, case) in enumerate(order, 1):
-                        label = f"pass{repeat}-{rate}fps-{writers}writers-{case}"
-                        settings = dict(raw, fps=rate, workers=writers, overflow="block", raw_chunks=chunks[case])
+                    for index, (geometry_label, rate, writers, case) in enumerate(order, 1):
+                        geometry = geometries[geometry_label]
+                        label = f"pass{repeat}-{geometry_label.replace('/', '-')}mib-{rate}fps-{writers}writers-{case}"
+                        settings = dict(raw, fps=rate, workers=writers, overflow="block",
+                                        angle_block=geometry["angle_block"], raw_chunks=geometry["raw_chunks"][case])
                         with TemporaryDirectory(prefix=f"{label}-", dir=output) as target:
                             sample, published, phase = pool.submit(
                                 trial, Path(target), scratch, case, settings, label, args.gpfs_counter_command).result()
                         kind, layout = CASES[case]
                         if layout == "bricks" and raw.get("detector_bricks") == "sinogram":
                             layout = "sinogram"
-                        samples.append(dict(trial=label, repeat=repeat, target_fps=rate, writers=writers, case=case,
+                        samples.append(dict(trial=label, repeat=repeat, geometry=geometry_label,
+                                            chunk_mib=geometry["chunk_mib"], partition_mib=geometry["partition_mib"],
+                                            target_fps=rate, writers=writers, case=case,
                                             format=kind, layout=layout, **sample))
                         partitions.extend(dict(trial=label, **row) for row in published)
                         timeline.append(phase)

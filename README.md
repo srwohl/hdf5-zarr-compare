@@ -163,6 +163,37 @@ a fresh output directory. Keep the detector size, frame count, rate and writer
 count the same. In `samples.csv`, compare `encode_seconds` (packing and any
 compression), `write_seconds`, and `sync_seconds`. Writer times can overlap.
 
+#### Sweep chunk and partition sizes on GPFS
+
+Against the 8 MiB GPFS block-size reference, start with four geometry points
+and hold source rate, workers, and fsync fixed. `--geometry` takes the inner
+chunk and the HDF5 part file or Zarr shard size in uncompressed MiB.
+
+| Chunk MiB | Partition MiB | Comparison |
+|---:|---:|---|
+| 8 | 32 | Current detector baseline |
+| 8 | 128 | Larger files or shards at the same chunk size |
+| 2 | 128 | Smaller chunks at the same file or shard size |
+| 32 | 128 | Larger chunks at the same file or shard size |
+
+```bash
+./run-hpc.sh "$GPFS_PROJECT/detector-geometry-$(date -u +%Y%m%dT%H%M%SZ)" "$VOXEL_WORK" \
+  --detector-size 2048 --frames 256 --rates 500 --writers 2 --repeats 1 \
+  --compression none --geometry 8:32 --geometry 8:128 --geometry 2:128 --geometry 32:128
+```
+
+This stages the source once and runs four cases per geometry. Compare useful
+GB/s, raw file count and publication P95. The report shows the exact chunk
+shapes. Each partition holds whole frames and each run holds whole partitions.
+Larger partitions increase memory use per worker and take more frames to
+assemble before publication. Record the GPFS block size for the mount you
+test. The report includes payload bytes and optional GPFS client counters.
+
+For follow-up passes, compare gzip on the best geometries, then vary writer
+count using `--writers 2,4,8` on a suitably sized CPU allocation. Use `--no-sync`
+in a separate pass to measure buffered publication. For reconstruction read
+patterns, use the saved-experiment read profiling commands below.
+
 ### See how parallel reads overlap
 
 Replay the same recorded detector selections with one and two readers and

@@ -1,0 +1,10 @@
+task = "write-matrix"
+
+[options]
+detector-size = 2048
+frames = 256
+rates = [500]
+writers = [2]
+repeats = 1
+compression = "none"
+geometry = ["8:32", "8:128", "2:128", "32:128"]

@@ -1,0 +1,9 @@
+task = "write-matrix"
+
+[options]
+detector-size = 2048
+frames = 256
+rates = [500]
+writers = [2]
+repeats = 1
+compression = "none"

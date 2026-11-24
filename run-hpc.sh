@@ -2,28 +2,43 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s OUTPUT_DIRECTORY [LOCAL_WORK_DIRECTORY]\n' "${0##*/}"
+    printf 'Usage: %s --config CONFIG.toml\n' "${0##*/}"
+    printf '       %s OUTPUT_DIRECTORY [LOCAL_WORK_DIRECTORY]\n' "${0##*/}"
     printf '       %s OUTPUT_DIRECTORY LOCAL_WORK_DIRECTORY --detector-size PIXELS [MATRIX_OPTIONS]\n' "${0##*/}"
-    printf 'Run the GPFS benchmark with detector staging on node-local scratch.\n'
+    printf 'Config runs create results under GPFS_PROJECT and use VOXEL_WORK or node-local scratch.\n'
 }
 
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     exit 0
 fi
-if (( $# < 1 )) || { (( $# > 2 )) && [[ $3 != --detector-size && $3 != --detector-size=* ]]; }; then
-    usage >&2
-    exit 2
-fi
-
-output=$(realpath -m -- "$1")
-if [[ -e $1 || -L $1 ]]; then
-    printf 'Choose a new output directory. Already exists: %s\n' "$1" >&2
-    exit 2
+work_dir=${VOXEL_WORK:-${SLURM_TMPDIR:-/tmp/$(id -un)}/voxel-io}
+config=
+if [[ ${1:-} == --config ]]; then
+    if (( $# != 2 )); then
+        usage >&2
+        exit 2
+    fi
+    if [[ ! -d ${GPFS_PROJECT:-} ]]; then
+        printf 'Set GPFS_PROJECT to your writable project directory.\n' >&2
+        exit 2
+    fi
+    config=$(realpath -e -- "$2")
+    project=$(realpath -e -- "$GPFS_PROJECT")
+else
+    if (( $# < 1 )) || { (( $# > 2 )) && [[ $3 != --detector-size && $3 != --detector-size=* ]]; }; then
+        usage >&2
+        exit 2
+    fi
+    output=$(realpath -m -- "$1")
+    if [[ -e $1 || -L $1 ]]; then
+        printf 'Choose a new output directory. Already exists: %s\n' "$1" >&2
+        exit 2
+    fi
+    work_dir=${2:-$work_dir}
 fi
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-work_dir=${2:-${SLURM_TMPDIR:-/tmp/$(id -un)}/voxel-io}
 (umask 077; mkdir -p -- "$work_dir")
 work_dir=$(cd -- "$work_dir" && pwd -P)
 scratch="$work_dir/scratch"
@@ -61,10 +76,14 @@ elif ! pixi=$(command -v pixi); then
 fi
 
 cd -- "$source_dir"
-printf 'Compute node: %s\nPixi: %s\nLocal scratch: %s\nBenchmark output: %s\n' \
-    "$(hostname)" "$pixi" "$scratch" "$output"
+printf 'Compute node: %s\nPixi: %s\nLocal scratch: %s\n' "$(hostname)" "$pixi" "$scratch"
+if [[ -z $config ]]; then
+    printf 'Benchmark output: %s\n' "$output"
+fi
 "$pixi" install --locked
-if (( $# > 2 )); then
+if [[ -n $config ]]; then
+    "$pixi" run --locked python run_config.py "$config" "$project" "$scratch"
+elif (( $# > 2 )); then
     "$pixi" run --locked write-matrix "$output" --scratch "$scratch" "${@:3}"
 else
     "$pixi" run --locked experiment "$output" --profile gpfs --scratch "$scratch"

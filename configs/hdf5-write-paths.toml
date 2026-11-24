@@ -1,0 +1,11 @@
+task = "write-matrix"
+
+[options]
+detector-size = 2048
+frames = 256
+rates = [500]
+writers = [2]
+repeats = 2
+geometry = ["8:32"]
+compression = "none"
+compare-hdf5-writes = true

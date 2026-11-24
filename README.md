@@ -86,30 +86,38 @@ napari --plugin napari-ome-zarr /gpfs/project/voxel-baseline/C/phantom.ome.zarr
 
 ### Run on an HPC compute node
 
-`run-hpc.sh` runs the 256³ benchmark once and writes its results to GPFS.
-It uses node-local scratch for staging and works with no home directory. It
+`run-hpc.sh` reads a TOML config and writes the results to GPFS. It uses
+node-local scratch for staging and works with no home directory. It
 reuses the `tango-ucx-benchmarks` Pixi deployment under `/tmp/$(id -un)/tango-ucx`
 when available. It can also use Pixi on `PATH` or download the Linux x86_64
 binary into scratch. The locked environment may need to download packages on
 the first run.
 
-From your compute-node shell, set `GPFS_PROJECT` to your writable GPFS
-directory. Use executable node-local scratch for `VOXEL_WORK`.
+From your compute-node shell, export `GPFS_PROJECT` once. `VOXEL_WORK` can
+point to any executable node-local scratch directory. Its default is
+`voxel-io` under `$SLURM_TMPDIR`, or `/tmp/$(id -un)/voxel-io`.
 
 ```bash
-GPFS_PROJECT=/gpfs/YOUR_PROJECT/YOUR_WRITABLE_DIR
-VOXEL_WORK="${SLURM_TMPDIR:-/tmp/$(id -un)}/voxel-io"
+export GPFS_PROJECT=/gpfs/YOUR_PROJECT/YOUR_WRITABLE_DIR
+export VOXEL_WORK="${VOXEL_WORK:-${SLURM_TMPDIR:-/tmp/$(id -un)}/voxel-io}"
 (umask 077; mkdir -p "$VOXEL_WORK")
 git clone https://github.com/srwohl/hdf5-zarr-compare.git "$VOXEL_WORK/src"
 cd "$VOXEL_WORK/src"
 
-BASELINE="$GPFS_PROJECT/voxel-baseline-$(date -u +%Y%m%dT%H%M%SZ)-${SLURM_JOB_ID:-manual}"
-./run-hpc.sh "$BASELINE" "$VOXEL_WORK"
+./run-hpc.sh --config configs/beamline-gpfs.toml
 ```
 
-Open `$BASELINE/report.md` and look for **All four cases passed**. Keep
-`experiment.json` and `timeline.json` with the report. Each benchmark needs
-a fresh output directory.
+Each invocation prints and creates a fresh result directory named after the
+config, with a UTC timestamp and a unique suffix. It saves the input as
+`config.toml` alongside `report.md` and `timeline.json`.
+
+Copy a file from `configs/` to try a different experiment. Set `task` to
+`experiment` or `write-matrix`. Keys in `[options]` match the task's CLI flags
+without the leading `--`. Use arrays for `rates`, `writers`, and `geometry`.
+Set switch flags such as `no-sync` or `compare-hdf5-writes` to `true` to enable
+them. For a matrix based on a saved experiment, set `baseline` above
+`[options]` and remove the synthetic detector options. Relative baseline paths
+are resolved from the config's directory.
 
 ### Run a small write matrix
 
@@ -150,18 +158,17 @@ on local scratch before timing and skips reconstruction. All four cases
 replay and verify the same pixels, with gzip and fsync enabled.
 
 ```bash
-./run-hpc.sh "$GPFS_PROJECT/detector-2048-$(date -u +%Y%m%dT%H%M%SZ)" "$VOXEL_WORK" \
-  --detector-size 2048 --frames 256 --rates 500 --writers 2 --repeats 1
+./run-hpc.sh --config configs/detector-gzip.toml
 ```
 
 Open the output `report.md` for received, published, and compressed payload
 GB/s. Increase `--frames` in multiples of four for longer runs. The synthetic
 mode takes a square detector size in pixels, with an even width.
 
-To measure how gzip affects throughput, repeat with `--compression none` and
-a fresh output directory. Keep the detector size, frame count, rate and writer
-count the same. In `samples.csv`, compare `encode_seconds` (packing and any
-compression), `write_seconds`, and `sync_seconds`. Writer times can overlap.
+To measure how gzip affects throughput, run the matching control with
+`./run-hpc.sh --config configs/detector-uncompressed.toml`. In `samples.csv`,
+compare `encode_seconds` (packing and any compression), `write_seconds`, and
+`sync_seconds`. Writer times can overlap.
 
 #### Sweep chunk and partition sizes on GPFS
 
@@ -177,9 +184,7 @@ chunk and the HDF5 part file or Zarr shard size in uncompressed MiB.
 | 32 | 128 | Larger chunks at the same file or shard size |
 
 ```bash
-./run-hpc.sh "$GPFS_PROJECT/detector-geometry-$(date -u +%Y%m%dT%H%M%SZ)" "$VOXEL_WORK" \
-  --detector-size 2048 --frames 256 --rates 500 --writers 2 --repeats 1 \
-  --compression none --geometry 8:32 --geometry 8:128 --geometry 2:128 --geometry 32:128
+./run-hpc.sh --config configs/detector-geometry.toml
 ```
 
 This stages the source once and runs four cases per geometry. Compare useful
@@ -190,9 +195,10 @@ assemble before publication. Record the GPFS block size for the mount you
 test. The report includes payload bytes and optional GPFS client counters.
 
 For follow-up passes, compare gzip on the best geometries, then vary writer
-count using `--writers 2,4,8` on a suitably sized CPU allocation. Use `--no-sync`
-in a separate pass to measure buffered publication. For reconstruction read
-patterns, use the saved-experiment read profiling commands below.
+count using `writers = [2, 4, 8]` on a suitably sized CPU allocation. Use
+`no-sync = true` in a separate pass to measure buffered publication. For
+reconstruction read patterns, use the saved-experiment read profiling commands
+below.
 
 #### Compare HDF5 memory and file writes
 
@@ -204,9 +210,7 @@ the same publication markers. Two repeats reverse the trial order on the
 second pass.
 
 ```bash
-./run-hpc.sh "$GPFS_PROJECT/hdf5-write-paths-$(date -u +%Y%m%dT%H%M%SZ)" "$VOXEL_WORK" \
-  --detector-size 2048 --frames 256 --rates 500 --writers 2 --repeats 2 \
-  --geometry 8:32 --compression none --compare-hdf5-writes
+./run-hpc.sh --config configs/hdf5-write-paths.toml
 ```
 
 Compare **Full-run GB/s** within A (acquisition chunks) and within B (bricks).

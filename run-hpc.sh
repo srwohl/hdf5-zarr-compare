@@ -47,6 +47,7 @@ mkdir -p -- "$scratch"
 export XDG_CACHE_HOME="$work_dir/cache"
 export XDG_CONFIG_HOME="$work_dir/config"
 export XDG_DATA_HOME="$work_dir/share"
+export VOXEL_SOURCE_CACHE="${VOXEL_SOURCE_CACHE:-$work_dir/source-cache}"
 export MPLBACKEND=Agg
 
 tango_deploy="/tmp/$(id -un)/tango-ucx"

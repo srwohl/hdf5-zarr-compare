@@ -111,6 +111,18 @@ Each invocation prints and creates a fresh result directory named after the
 config, with a UTC timestamp and a unique suffix. It saves the input as
 `config.toml` alongside `report.md` and `timeline.json`.
 
+The launcher caches generated detector frames and calibration under
+`$VOXEL_WORK/source-cache`. For the beamline experiment, reusing the frames
+also skips generation of the phantom and its projections. Geometry, worker,
+and compression sweeps with the same detector inputs reuse an entry. The
+reports record whether the input was generated or reused. Each run still
+replays the frames and measures its own writes and reconstruction stages.
+
+Set `VOXEL_SOURCE_CACHE` to use another node-local cache directory, or use
+`no-source-cache = true` in `[options]` to generate inputs in temporary
+scratch for one run. Each 2048 × 2048, 256-frame synthetic source uses about
+2 GiB plus calibration. Entries last as long as the scratch directory does.
+
 Copy a file from `configs/` to try a different experiment. Set `task` to
 `experiment` or `write-matrix`. Keys in `[options]` match the task's CLI flags
 without the leading `--`. Use arrays for `rates`, `writers`, and `geometry`.

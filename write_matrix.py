@@ -1,5 +1,6 @@
 """Measure acquisition writes against the same stored or synthetic detector data."""
 import argparse
+from inspect import getsource
 import itertools
 import json
 from math import prod
@@ -20,6 +21,7 @@ from demo import MIB
 from experiment import CASES, Timeline, footprint, mount_info, save_csv, save_json, verify_raw
 from profile_raw_reads import fresh_reader_pool as fresh_trial_pool
 from replay import RawWriter, gb_per_second, run_replay
+from source_cache import add_cache_options, prepare_source
 from tiled import raw_reader
 
 
@@ -220,6 +222,8 @@ def report(output, setup, summary):
     width = raw["tile"]
     frames = len(raw["angles_deg"]) * len(raw["tile_origins_yx_px"])
     source = "synthetic counts with Poisson noise" if setup["baseline"] is None else "saved detector replay"
+    cache = (f"Generated detector input cache: **{setup['source_cache']}**. "
+             if setup["baseline"] is None else "")
     passes = "1 pass" if setup["repeats"] == 1 else f"{setup['repeats']} passes"
     comparison = []
     if setup["compare_hdf5_writes"]:
@@ -235,7 +239,7 @@ def report(output, setup, summary):
                       "For file cases, `write_seconds` includes encoding the shard.", ""]
     lines = ["# Detector write matrix", "",
              f"{passes} at each setting, with a fresh process and fresh output per trial. "
-             f"Destination was **{filesystem}**, staged source **{scratch}**. "
+             f"Destination was **{filesystem}**, staged source **{scratch}**. {cache}"
              f"{compression}, fsync {sync}, "
              f"{raw['queue_frames']} queued frames. Zarr async concurrency was {setup['zarr_concurrency']}. "
              f"All cases shared the same {len(setup['cpu_affinity'])} logical CPUs. {quality}", "",
@@ -307,6 +311,7 @@ def main():
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--scratch", type=Path, help="temporary source path, ideally on local storage")
+    add_cache_options(parser)
     parser.add_argument("--gpfs-counter-command", default=os.environ.get("VOXEL_GPFS_COUNTER_COMMAND"))
     args = parser.parse_args()
     try:
@@ -360,11 +365,18 @@ def main():
         samples, partitions, timeline = [], [], []
         with TemporaryDirectory(prefix="voxel-source-", dir=args.scratch) as source:
             scratch = Path(source)
-            setup["source_mount"] = mount_info(scratch)
             if directory is None:
-                stage_synthetic(scratch, raw)
+                identity = dict(width=raw["tile"], frames=len(raw["angles_deg"]), seed=raw["seed"],
+                                photons=raw["photons"], dark=raw["dark"], numpy=np.__version__,
+                                generator=getsource(stage_synthetic))
+                cache = None if args.no_source_cache else args.source_cache
+                scratch, setup["source_cache"] = prepare_source(scratch, cache, "synthetic", identity,
+                                                                 lambda path: stage_synthetic(path, raw))
+                if cache is not None:
+                    setup["source_cache_key"] = scratch.name
             else:
                 stage_frames(directory, scratch, raw)
+            setup["source_mount"] = mount_info(scratch)
             with fresh_trial_pool() as pool:
                 for repeat in range(1, args.repeats + 1):
                     order = combinations if repeat % 2 else combinations[::-1]

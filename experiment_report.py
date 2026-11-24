@@ -93,7 +93,8 @@ def make_report(directory, metadata, timeline):
         f"**{verdict}.** Identical reconstructed voxels and ROI across all cases: **{match_text}**.", "",
         f"Profile **{metadata['profile']}**, host **{metadata['host']}**, output mount "
         f"**{mount.get('fstype', 'unknown')}** at `{mount.get('target', '?')}`. "
-        "Cache state was uncontrolled. Read timings can include cache hits.", "",
+        "OS and filesystem cache state was uncontrolled. Read timings can include cache hits.", "",
+        f"Generated detector input cache: **{metadata.get('source_cache', 'unrecorded')}**.", "",
         f"{raw['size']}³ voxels at 1 µm spacing, {len(raw['angles_deg'])} angles, "
         f"{len(raw['tile_origins_yx_px'])} tiles per angle, {raw['fps']:g} tile frames/s requested, "
         f"{raw['queue_frames']} queue slots, {raw['angle_block']} angles per raw part, "

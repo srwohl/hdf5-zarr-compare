@@ -4,6 +4,8 @@ from contextlib import contextmanager
 import csv
 from datetime import datetime, timezone
 import hashlib
+from importlib.metadata import version
+from inspect import getsource
 import itertools
 import json
 import math
@@ -28,6 +30,7 @@ import replay
 import tiled
 from experiment_report import context_plot, make_report
 from phantom import make_pyramid
+from source_cache import add_cache_options, prepare_source
 
 CASES = {"A": ("nexus", "acquisition"), "B": ("nexus", "bricks"),
          "C": ("zarr", "acquisition"), "D": ("zarr", "bricks")}
@@ -350,8 +353,21 @@ def run(args):
         scratch = Path(temporary)
         metadata["scratch_mount"] = mount_info(scratch)
         with timeline.phase("shared", "simulate", counters=False):
-            tiled.make_acquisition(scratch, raw, retain_reference=False)
-            raw_source = scratch / "raw-source"
+            identity = dict(
+                parameters={key: raw[key] for key in ("size", "tile", "tile_origins_yx_px", "angles_deg",
+                                                       "seed", "poisson", "photons", "dark", "mu_per_voxel")},
+                versions=[np.__version__, skimage.__version__, version("scipy")],
+                generator=getsource(tiled.make_acquisition),
+                phantom=Path(__file__).with_name("phantom.py").read_text(),
+            )
+            cache = None if args.no_source_cache else args.source_cache
+            staged, status = prepare_source(scratch, cache, "beamline", identity,
+                                            lambda path: tiled.make_acquisition(path, raw, retain_reference=False))
+            metadata["source_cache"] = status
+            if cache is not None:
+                metadata["source_cache_key"] = staged.name
+            metadata["source_mount"] = mount_info(staged)
+            raw_source = staged / "raw-source"
             sources = [np.load(raw_source / f"tile_{i}.npy", mmap_mode="r")
                        for i in range(len(raw["tile_origins_yx_px"]))]
         for case in args.case_order:
@@ -383,6 +399,7 @@ def main():
     p.add_argument("directory", type=Path, nargs="?", help="new output directory")
     p.add_argument("--profile", choices=("local", "gpfs"), default="local")
     p.add_argument("--scratch", type=Path, help="staging filesystem for detector replay and reconstruction")
+    add_cache_options(p)
     p.add_argument("--size", type=int)
     p.add_argument("--levels", type=int, default=3)
     p.add_argument("--angles", type=int)

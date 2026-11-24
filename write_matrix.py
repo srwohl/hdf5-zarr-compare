@@ -174,7 +174,7 @@ def summarize(samples, combinations):
         entry = {key: median(row[key] for row in group if row[key] is not None)
                  for key in keys if any(row[key] is not None for row in group)}
         summary.append(dict(geometry=geometry, case=case, format=group[0]["format"],
-                            layout=group[0]["layout"], target_fps=rate,
+                            layout=group[0]["layout"], hdf5_write_path=group[0]["hdf5_write_path"], target_fps=rate,
                             writers=writers, missing_frames=sum(row["missing_frames"] for row in group),
                             **entry))
     return summary
@@ -185,14 +185,17 @@ def plot_matrix(path, summary, groups):
     colors = ("#4578a8", "#82a9ce", "#257e6c", "#76b7a5")
     series = (("published_gb_s", "Useful detector GB/s", "During replay"),
               ("setup_to_last_publish_seconds", "Seconds", "Writer setup to last publication"))
+    cases = dict.fromkeys(row["case"] for row in summary)
     xs = np.arange(len(groups))
     for ax, (key, ylabel, title) in zip(axes, series):
-        for index, (case, color) in enumerate(zip(CASES, colors)):
+        for index, (case, color) in enumerate(zip(cases, colors)):
             rows = [row for row in summary if row["case"] == case]
             fmt = "HDF5" if rows[0]["format"] == "nexus" else "Zarr"
             layout = "frames" if rows[0]["layout"] == "acquisition" else rows[0]["layout"]
+            write_path = rows[0]["hdf5_write_path"]
+            label = f"{fmt} · {layout} · {write_path}" if write_path else f"{fmt} · {layout}"
             ax.bar(xs + (index - 1.5) * .18, [row[key] for row in rows], width=.17,
-                   color=color, label=f"{fmt} · {layout}")
+                   color=color, label=label)
         ax.set_xticks(xs, [f"{geometry} MiB\n{rate:g} fps\n{writers} {'writer' if writers == 1 else 'writers'}"
                           for geometry, rate, writers in groups])
         ax.set_ylabel(ylabel)
@@ -217,6 +220,12 @@ def report(output, setup, summary):
     frames = len(raw["angles_deg"]) * len(raw["tile_origins_yx_px"])
     source = "synthetic counts with Poisson noise" if setup["baseline"] is None else "saved detector replay"
     passes = "1 pass" if setup["repeats"] == 1 else f"{setup['repeats']} passes"
+    comparison = []
+    if setup["compare_hdf5_writes"]:
+        comparison = ["Memory cases build each HDF5 part with the core driver, then write its file image. "
+                      "File cases have HDF5 build the part directly in a temporary file on the destination mount. "
+                      "Both use the same rename and publication marker protocol. "
+                      "For file cases, `write_seconds` includes building the HDF5 part.", ""]
     lines = ["# Detector write matrix", "",
              f"{passes} at each setting, with a fresh process and fresh output per trial. "
              f"Destination was **{filesystem}**, staged source **{scratch}**. "
@@ -225,12 +234,12 @@ def report(output, setup, summary):
              f"All cases shared the same {len(setup['cpu_affinity'])} logical CPUs. {quality}", "",
              "Chunk and partition sizes are uncompressed MiB. Each partition becomes one HDF5 part file or Zarr shard "
              "per detector tile. Chunk shapes are angles × detector y × detector x.", "",
-             "| Chunk / partition MiB | Frames per partition per tile | A/C chunk shape | B/D chunk shape |",
+             "| Chunk / partition MiB | Frames per partition per tile | Acquisition chunk shape | Bricks chunk shape |",
              "|---|---:|---|---|",
              *[f"| {label} | {geometry['angle_block']} | "
                f"{' × '.join(map(str, geometry['raw_chunks']['A']))} | "
                f"{' × '.join(map(str, geometry['raw_chunks']['B']))} |"
-               for label, geometry in setup["geometries"].items()], "",
+               for label, geometry in setup["geometries"].items()], "", *comparison,
              "The replay source pauses when the bounded queue fills. Sustained received rate and blocked time "
              "show how closely the writer kept up with the configured source rate. "
              "The setup-to-last clock starts before initializing the writer and ends at the last visible marker.", "",
@@ -238,18 +247,19 @@ def report(output, setup, summary):
              f"One frame contains {width**2 * 2:,} uncompressed detector bytes. GB/s uses decimal gigabytes. "
              "Useful GB/s counts the original bytes in published frames. Payload GB/s counts the HDF5 part file "
              "or Zarr shard bytes handed to the filesystem during replay. Setup-inclusive GB/s counts useful "
-             "bytes from writer setup through last publication.", "",
+             "bytes from writer setup through last publication. Full-run GB/s includes final sync and worker teardown.", "",
              "![Writer scaling and time to last publication](write-matrix.png)", "",
              "| Chunk / partition MiB | Target fps | Writers | Case | Format / layout | Received fps | Published fps | "
-             "Useful GB/s | Payload GB/s | Setup-inclusive GB/s | Raw files | Blocked s | P95 ms | "
+             "Useful GB/s | Payload GB/s | Setup-inclusive GB/s | Full-run GB/s | Raw files | Blocked s | P95 ms | "
              "Setup to first s | Setup to last s | Missing |",
-             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for row in summary:
         fmt = "HDF5" if row["format"] == "nexus" else "Zarr"
         latency = row.get("publish_p95_ms", float("nan"))
         lines.append(f"| {row['geometry']} | {row['target_fps']} | {row['writers']} | {row['case']} | {fmt} / {row['layout']} | "
                      f"{row['sustained_received_fps']:.0f} | {row['sustained_published_fps']:.0f} | "
                      f"{row['published_gb_s']:.3f} | {row['payload_gb_s']:.3f} | {row['setup_to_last_gb_s']:.3f} | "
+                     f"{row['full_run_gb_s']:.3f} | "
                      f"{row['stored_files']:g} | {row['blocked_seconds']:.3f} | {latency:.0f} | "
                      f"{row['setup_to_first_publish_seconds']:.3f} | "
                      f"{row['setup_to_last_publish_seconds']:.3f} | {row['missing_frames']} |")
@@ -280,6 +290,8 @@ def main():
                         help="synthetic chunk and file/shard sizes in uncompressed MiB (repeatable)")
     parser.add_argument("--compression", choices=("gzip", "none"),
                         help="override output compression for all cases")
+    parser.add_argument("--compare-hdf5-writes", action="store_true",
+                        help="compare HDF5 memory and file output for both layouts (default: uncompressed, fsync on)")
     parser.add_argument("--no-sync", action="store_true", help="measure buffered writes with fsync disabled")
     parser.add_argument("--rates", type=integer_list, default=(500, 4000), help="comma-separated source rates")
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
@@ -303,6 +315,11 @@ def main():
                 raise ValueError("a verified four-case experiment is required")
             raw = experiment["raw"]
             chunks = {row["case"]: row["raw_chunks"] for row in experiment["case_results"]}
+        if args.compare_hdf5_writes:
+            raw = dict(raw, compression="none", sync=True)
+            cases = {f"{case}-{path}": (case, path) for case in ("A", "B") for path in ("memory", "file")}
+        else:
+            cases = {case: (case, None) for case in CASES}
         if args.compression is not None:
             raw = dict(raw, compression=args.compression)
         if args.no_sync:
@@ -320,11 +337,12 @@ def main():
             args.scratch.mkdir(parents=True, exist_ok=True)
         output = args.output.resolve()
         output.mkdir(parents=True, exist_ok=False)
-        combinations = list(itertools.product(geometries, args.rates, args.writers, CASES))
+        combinations = list(itertools.product(geometries, args.rates, args.writers, cases))
         first_geometry = next(iter(geometries.values()))
         setup = dict(baseline=str(directory) if directory else None, destination_mount=mount_info(output),
                      raw=dict(raw, angle_block=first_geometry["angle_block"]),
                      raw_chunks=first_geometry["raw_chunks"], geometries=geometries,
+                     compare_hdf5_writes=args.compare_hdf5_writes,
                      zarr_concurrency=raw.get("zarr_concurrency", zarr.config.get("async.concurrency")),
                      cpu_affinity=sorted(os.sched_getaffinity(0)), repeats=args.repeats)
         samples, partitions, timeline = [], [], []
@@ -338,11 +356,14 @@ def main():
             with fresh_trial_pool() as pool:
                 for repeat in range(1, args.repeats + 1):
                     order = combinations if repeat % 2 else combinations[::-1]
-                    for index, (geometry_label, rate, writers, case) in enumerate(order, 1):
+                    for index, (geometry_label, rate, writers, case_label) in enumerate(order, 1):
+                        case, write_path = cases[case_label]
                         geometry = geometries[geometry_label]
-                        label = f"pass{repeat}-{geometry_label.replace('/', '-')}mib-{rate}fps-{writers}writers-{case}"
+                        label = f"pass{repeat}-{geometry_label.replace('/', '-')}mib-{rate}fps-{writers}writers-{case_label}"
                         settings = dict(raw, fps=rate, workers=writers, overflow="block",
                                         angle_block=geometry["angle_block"], raw_chunks=geometry["raw_chunks"][case])
+                        if write_path:
+                            settings["hdf5_write_path"] = write_path
                         with TemporaryDirectory(prefix=f"{label}-", dir=output) as target:
                             sample, published, phase = pool.submit(
                                 trial, Path(target), scratch, case, settings, label, args.gpfs_counter_command).result()
@@ -351,7 +372,7 @@ def main():
                             layout = "sinogram"
                         samples.append(dict(trial=label, repeat=repeat, geometry=geometry_label,
                                             chunk_mib=geometry["chunk_mib"], partition_mib=geometry["partition_mib"],
-                                            target_fps=rate, writers=writers, case=case,
+                                            target_fps=rate, writers=writers, case=case_label, hdf5_write_path=write_path,
                                             format=kind, layout=layout, **sample))
                         partitions.extend(dict(trial=label, **row) for row in published)
                         timeline.append(phase)

@@ -194,6 +194,26 @@ count using `--writers 2,4,8` on a suitably sized CPU allocation. Use `--no-sync
 in a separate pass to measure buffered publication. For reconstruction read
 patterns, use the saved-experiment read profiling commands below.
 
+#### Compare HDF5 memory and file writes
+
+Run a paired test with the same frames, layouts, chunk sizes, writer count,
+and fsync. Each layout uses the HDF5 core driver in one trial and the regular
+filesystem driver in the other. The filesystem path builds the part in a
+temporary file on GPFS, then closes, fsyncs and renames it. Both paths use
+the same publication markers. Two repeats reverse the trial order on the
+second pass.
+
+```bash
+./run-hpc.sh "$GPFS_PROJECT/hdf5-write-paths-$(date -u +%Y%m%dT%H%M%SZ)" "$VOXEL_WORK" \
+  --detector-size 2048 --frames 256 --rates 500 --writers 2 --repeats 2 \
+  --geometry 8:32 --compression none --compare-hdf5-writes
+```
+
+Compare **Full-run GB/s** within A (acquisition chunks) and within B (bricks).
+It includes final sync and worker teardown. In `samples.csv`, `write_seconds`
+includes HDF5 file construction for the file path. For the memory path, look
+at `encode_seconds` and `write_seconds` together. Writer times can overlap.
+
 ### See how parallel reads overlap
 
 Replay the same recorded detector selections with one and two readers and

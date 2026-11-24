@@ -23,16 +23,18 @@ class ExperimentTests(unittest.TestCase):
             source.mkdir()
             np.save(source / "flat_0.npy", np.full((4, 4), 25, dtype=np.float32))
             np.save(source / "dark_0.npy", np.zeros((4, 4), dtype=np.float32))
-            for kind in ("nexus", "zarr"):
-                with self.subTest(kind=kind):
-                    output = root / kind
+            for kind, path in (("nexus", "memory"), ("nexus", "file"), ("zarr", None)):
+                with self.subTest(kind=kind, path=path):
+                    output = root / (f"{kind}-{path}" if path else kind)
                     output.mkdir()
-                    writer = replay.RawWriter(output, config, kind, source)
+                    settings = dict(config, hdf5_write_path=path) if path else config
+                    writer = replay.RawWriter(output, settings, kind, source)
                     writer.publish(0, [frames], [])
                     published = output / "publications"
                     self.assertEqual(json.loads((published / "00000000.json").read_text()),
                                      dict(angle_start=0, angle_stop=4, missing_frames=[]))
                     self.assertFalse((published / "00000004.json").exists())
+                    self.assertFalse(list(output.rglob("*.partial")))
                     with tiled.raw_reader(output, config, kind, []) as (read, _):
                         selection = (slice(0, 4),) * 3
                         np.testing.assert_array_equal(read(0, selection, "published"), frames)

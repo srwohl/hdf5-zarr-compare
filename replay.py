@@ -46,6 +46,7 @@ class RawWriter:
         self.chunks = tuple(config["raw_chunks"])
         self.sync = config["sync"]
         self.compression = config["compression"]
+        self.hdf5_write_path = config.get("hdf5_write_path", "memory")
         self.publications = directory / "publications"
         self.publications.mkdir()
         if kind == "nexus":
@@ -89,31 +90,56 @@ class RawWriter:
             buffer = memory.get(f"data/{self.key((0, 0, 0))}")
             path = self.root_path / f"tile_{tile}/data" / self.key((start // self.shard[0], 0, 0))
             return path, None if buffer is None else buffer.as_buffer_like()
-        path = self.root_path / f"tile_{tile}/part_{start}.nxs"
-        options = {"compression": "gzip", "compression_opts": 1} if self.compression == "gzip" else {}
+        path = self.nexus_part_path(tile, start)
         with h5py.File(str(path), "w", driver="core", backing_store=False) as handle:
-            handle.attrs["default"] = "entry"
-            entry = demo.nxgroup(handle, "entry", "NXentry")
-            entry.attrs["default"] = "data"
-            data = demo.nxgroup(entry, "data", "NXdata")
-            data.attrs["signal"] = "data"
-            data.create_dataset("data", data=values, chunks=self.chunks, **options).attrs["units"] = "counts"
+            self.write_nexus_dataset(handle, values)
             handle.flush()
             return path, handle.id.get_file_image()
+
+    def nexus_part_path(self, tile, start):
+        return self.root_path / f"tile_{tile}/part_{start}.nxs"
+
+    def write_nexus_dataset(self, handle, values):
+        options = {"compression": "gzip", "compression_opts": 1} if self.compression == "gzip" else {}
+        handle.attrs["default"] = "entry"
+        entry = demo.nxgroup(handle, "entry", "NXentry")
+        entry.attrs["default"] = "data"
+        data = demo.nxgroup(entry, "data", "NXdata")
+        data.attrs["signal"] = "data"
+        data.create_dataset("data", data=values, chunks=self.chunks, **options).attrs["units"] = "counts"
+
+    def write_nexus_file(self, path, values):
+        started = time.perf_counter()
+        temporary = path.with_suffix(path.suffix + ".partial")
+        with h5py.File(temporary, "w") as handle:
+            self.write_nexus_dataset(handle, values)
+        size = temporary.stat().st_size
+        written = time.perf_counter()
+        if self.sync:
+            with temporary.open("r+b") as handle:
+                os.fsync(handle.fileno())
+        flushed = time.perf_counter()
+        temporary.replace(path)
+        return size, written - started + time.perf_counter() - flushed, flushed - written if self.sync else 0.
 
     def publish(self, start, frames, missing):
         encode_seconds = write_seconds = sync_seconds = payload_bytes = 0
         for tile, values in enumerate(frames):
-            started = time.perf_counter()
-            path, payload = self.pack(tile, start, values)
-            encode_seconds += time.perf_counter() - started
-            if payload is None:
-                continue
-            payload_bytes += len(payload)
-            started = time.perf_counter()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_seconds += time.perf_counter() - started
-            written, synced = atomic_payload(path, payload, self.sync)
+            if self.kind == "nexus" and self.hdf5_write_path == "file":
+                path = self.nexus_part_path(tile, start)
+                size, written, synced = self.write_nexus_file(path, values)
+            else:
+                started = time.perf_counter()
+                path, payload = self.pack(tile, start, values)
+                encode_seconds += time.perf_counter() - started
+                if payload is None:
+                    continue
+                size = len(payload)
+                started = time.perf_counter()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_seconds += time.perf_counter() - started
+                written, synced = atomic_payload(path, payload, self.sync)
+            payload_bytes += size
             write_seconds += written
             sync_seconds += synced
             if self.sync:

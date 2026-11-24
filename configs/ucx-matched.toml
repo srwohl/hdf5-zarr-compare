@@ -1,0 +1,14 @@
+# Closest write-matrix match to the tango-bulk HDF5 client sweep:
+# uncompressed, effectively unpaced source, no per-partition fsync, large partitions.
+# Compare with the client's GB/s, which also stops before the final sync.
+task = "write-matrix"
+
+[options]
+detector-size = 2048
+frames = 256
+rates = [4000]
+writers = [1, 2, 4, 8]
+repeats = 1
+geometry = ["8:128"]
+compression = "none"
+no-sync = true

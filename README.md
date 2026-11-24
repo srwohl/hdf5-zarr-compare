@@ -84,6 +84,33 @@ include the plugin's headless layer and ROI read check in the report.
 napari --plugin napari-ome-zarr /gpfs/project/voxel-baseline/C/phantom.ome.zarr
 ```
 
+### Run on an HPC compute node
+
+`run-hpc.sh` runs the 256³ benchmark once and writes its results to GPFS.
+It uses node-local scratch for staging and works with no home directory. It
+reuses the `tango-ucx-benchmarks` Pixi deployment under `/tmp/$(id -un)/tango-ucx`
+when available. It can also use Pixi on `PATH` or download the Linux x86_64
+binary into scratch. The locked environment may need to download packages on
+the first run.
+
+From your compute-node shell, set `GPFS_PROJECT` to your writable GPFS
+directory. Use executable node-local scratch for `VOXEL_WORK`.
+
+```bash
+GPFS_PROJECT=/gpfs/YOUR_PROJECT/YOUR_WRITABLE_DIR
+VOXEL_WORK="${SLURM_TMPDIR:-/tmp/$(id -un)}/voxel-io"
+(umask 077; mkdir -p "$VOXEL_WORK")
+git clone https://github.com/srwohl/hdf5-zarr-compare.git "$VOXEL_WORK/src"
+cd "$VOXEL_WORK/src"
+
+BASELINE="$GPFS_PROJECT/voxel-baseline-$(date -u +%Y%m%dT%H%M%SZ)-${SLURM_JOB_ID:-manual}"
+./run-hpc.sh "$BASELINE" "$VOXEL_WORK"
+```
+
+Open `$BASELINE/report.md` and look for **All four cases passed**. Keep
+`experiment.json` and `timeline.json` with the report. Each benchmark needs
+a fresh output directory.
+
 ### Run a small write matrix
 
 Replay the same verified detector frames at two source rates with one and

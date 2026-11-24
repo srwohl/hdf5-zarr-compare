@@ -158,6 +158,11 @@ Open the output `report.md` for received, published, and compressed payload
 GB/s. Increase `--frames` in multiples of four for longer runs. The synthetic
 mode takes a square detector size in pixels, with an even width.
 
+To measure how gzip affects throughput, repeat with `--compression none` and
+a fresh output directory. Keep the detector size, frame count, rate and writer
+count the same. In `samples.csv`, compare `encode_seconds` (packing and any
+compression), `write_seconds`, and `sync_seconds`. Writer times can overlap.
+
 ### See how parallel reads overlap
 
 Replay the same recorded detector selections with one and two readers and

@@ -166,6 +166,7 @@ def report(output, setup, summary):
     raw = setup["raw"]
     filesystem = setup["destination_mount"].get("fstype", "unknown")
     scratch = setup["source_mount"].get("fstype", "unknown")
+    compression = "gzip compression" if raw["compression"] == "gzip" else "uncompressed output"
     sync = "on" if raw["sync"] else "off"
     quality = "Every trial was reread and matched the source." if setup["verified"] else "At least one trial was incomplete."
     chunk_shapes = " · ".join(f"{case} {' × '.join(map(str, shape))}" for case, shape in setup["raw_chunks"].items())
@@ -176,7 +177,7 @@ def report(output, setup, summary):
     lines = ["# Detector write matrix", "",
              f"{passes} at each setting, with a fresh process and fresh output per trial. "
              f"Destination was **{filesystem}**, staged source **{scratch}**. "
-             f"{raw['compression']} compression, fsync {sync}, {raw['angle_block']} angles per file or shard, "
+             f"{compression}, fsync {sync}, {raw['angle_block']} angles per file or shard, "
              f"{raw['queue_frames']} queued frames. Zarr async concurrency was {setup['zarr_concurrency']}. "
              f"All cases shared the same {len(setup['cpu_affinity'])} logical CPUs. {quality}", "",
              f"Raw chunk dimensions in angles × detector y × detector x. {chunk_shapes}.", "",
@@ -224,6 +225,8 @@ def main():
     parser.add_argument("output", type=Path, help="new write matrix directory on the filesystem under test")
     parser.add_argument("--detector-size", type=int, metavar="PIXELS", help="synthetic square detector width in pixels")
     parser.add_argument("--frames", type=int, help="synthetic frame count (default: 256, multiple of 4)")
+    parser.add_argument("--compression", choices=("gzip", "none"),
+                        help="override output compression for all cases")
     parser.add_argument("--rates", type=integer_list, default=(500, 4000), help="comma-separated source rates")
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
     parser.add_argument("--repeats", type=int, default=2)
@@ -246,6 +249,8 @@ def main():
                 raise ValueError("a verified four-case experiment is required")
             raw = experiment["raw"]
             chunks = {row["case"]: row["raw_chunks"] for row in experiment["case_results"]}
+        if args.compression is not None:
+            raw = dict(raw, compression=args.compression)
         if max(args.writers) > len(raw["angles_deg"]) // raw["angle_block"]:
             raise ValueError("writer count exceeds available angle blocks")
         if args.scratch:

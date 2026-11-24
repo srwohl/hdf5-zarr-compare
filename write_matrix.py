@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import zarr
 
+from chunk_layout import raw_extents, summarize as layout_summary
 from demo import MIB
 from experiment import CASES, Timeline, footprint, mount_info, save_csv, save_json, verify_raw
 from profile_raw_reads import fresh_reader_pool as fresh_trial_pool
@@ -135,7 +136,12 @@ def trial_throughput(stats, phase):
                                         if client_bytes is not None else None))
 
 
-def trial(directory, scratch, case, config, label, counter_command):
+def layout_block(mount):
+    """Prefer the Storage Scale block size, then the preferred I/O size from stat."""
+    return mount.get("mmlsfs", {}).get("blockSize") or mount.get("st_blksize") or 4096
+
+
+def trial(directory, scratch, case, config, label, counter_command, block):
     sources = [np.load(path, mmap_mode="r") for path in sorted(scratch.glob("tile_*.npy"),
                                                                key=lambda path: int(path.stem.split("_")[1]))]
     kind = CASES[case][0]
@@ -156,6 +162,7 @@ def trial(directory, scratch, case, config, label, counter_command):
     storage = footprint(writer.root_path)
     stats.update(stored_files=storage["files"], raw_logical_bytes=storage["logical_bytes"],
                  raw_allocated_bytes=storage["allocated_bytes"])
+    stats.update(layout_summary(raw_extents(writer.root_path, kind), block))
     if stats["missing_frames"] == 0:
         verify_raw(directory, config, kind, sources, scratch)
     stats["verified"] = stats["missing_frames"] == 0
@@ -169,7 +176,8 @@ def summarize(samples, combinations):
             "setup_to_last_publish_seconds", "setup_to_first_publish_seconds", "acquisition_wall_seconds",
             "worker_setup_seconds", "encode_seconds", "write_seconds", "sync_seconds", "raw_logical_bytes",
             "stored_files", "received_gb_s", "published_gb_s", "payload_gb_s", "setup_to_last_gb_s",
-            "full_run_gb_s", "gpfs_client_write_gb_s")
+            "full_run_gb_s", "gpfs_client_write_gb_s", "raw_allocated_bytes", "layout_chunks",
+            "layout_misaligned_chunks")
     for geometry, rate, writers, case in combinations:
         group = [row for row in samples
                  if (row["geometry"], row["target_fps"], row["writers"], row["case"]) == (geometry, rate, writers, case)]
@@ -177,15 +185,16 @@ def summarize(samples, combinations):
                  for key in keys if any(row[key] is not None for row in group)}
         summary.append(dict(geometry=geometry, case=case, format=group[0]["format"],
                             layout=group[0]["layout"], hdf5_write_path=group[0]["hdf5_write_path"],
-                            zarr_write_path=group[0]["zarr_write_path"], target_fps=rate,
+                            zarr_write_path=group[0]["zarr_write_path"],
+                            hdf5_alignment_mib=group[0]["hdf5_alignment_mib"], target_fps=rate,
                             writers=writers, missing_frames=sum(row["missing_frames"] for row in group),
                             **entry))
     return summary
 
 
-def plot_matrix(path, summary, groups):
+def plot_matrix(path, summary, groups, setup_alignment):
     fig, axes = plt.subplots(1, 2, figsize=(max(11.5, min(25, len(groups) * 2)), 4.5), layout="constrained")
-    colors = ("#4578a8", "#82a9ce", "#257e6c", "#76b7a5")
+    colors = ("#4578a8", "#82a9ce", "#257e6c", "#76b7a5", "#a8734a", "#d1a27c", "#7a5c99", "#b39dcc")
     series = (("published_gb_s", "Useful detector GB/s", "During replay"),
               ("setup_to_last_publish_seconds", "Seconds", "Writer setup to last publication"))
     cases = dict.fromkeys(row["case"] for row in summary)
@@ -195,9 +204,13 @@ def plot_matrix(path, summary, groups):
             rows = [row for row in summary if row["case"] == case]
             fmt = "HDF5" if rows[0]["format"] == "nexus" else "Zarr"
             layout = "frames" if rows[0]["layout"] == "acquisition" else rows[0]["layout"]
-            write_path = rows[0]["hdf5_write_path"] or rows[0]["zarr_write_path"]
-            label = f"{fmt} · {layout} · {write_path}" if write_path else f"{fmt} · {layout}"
-            ax.bar(xs + (index - 1.5) * .18, [row[key] for row in rows], width=.17,
+            variants = [rows[0]["hdf5_write_path"] or rows[0]["zarr_write_path"]]
+            if rows[0]["format"] == "nexus" and (setup_alignment or rows[0]["hdf5_alignment_mib"]):
+                alignment = rows[0]["hdf5_alignment_mib"]
+                variants.append(f"aligned {alignment:g} MiB" if alignment else "default layout")
+            label = " · ".join([fmt, layout, *filter(None, variants)])
+            width = .72 / len(cases)
+            ax.bar(xs + (index - (len(cases) - 1) / 2) * width, [row[key] for row in rows], width=width * .94,
                    color=color, label=label)
         ax.set_xticks(xs, [f"{geometry} MiB\n{rate:g} fps\n{writers} {'writer' if writers == 1 else 'writers'}"
                           for geometry, rate, writers in groups])
@@ -210,9 +223,28 @@ def plot_matrix(path, summary, groups):
     plt.close(fig)
 
 
+def layout_note(setup):
+    mount = setup["destination_mount"]
+    settings = mount.get("mmlsfs", {})
+    source = "Storage Scale block size from mmlsfs" if settings.get("blockSize") else "preferred I/O size from stat"
+    block = setup["layout_block"]
+    size = f"{block / MIB:g} MiB" if block >= MIB else f"{block / 1024:g} KiB"
+    note = (f"Chunk placement was checked against {size} blocks ({source}). "
+            "A chunk is misaligned when it touches more blocks than its size needs. "
+            "This is computed from the stored HDF5 chunk addresses and Zarr shard indexes.")
+    if setup["hdf5_alignment_mib"] and not setup["compare_hdf5_alignment"]:
+        note += f" HDF5 chunks used a {setup['hdf5_alignment_mib']:g} MiB alignment request."
+    if settings:
+        details = ", ".join(f"{key} {value}" for key, value in settings.items())
+        note += f" mmlsfs reported {details}."
+    elif "mmlsfs_error" in mount:
+        note += " mmlsfs was present but did not report settings."
+    return note
+
+
 def report(output, setup, summary):
     groups = list(dict.fromkeys((row["geometry"], row["target_fps"], row["writers"]) for row in summary))
-    plot_matrix(output / "write-matrix.png", summary, groups)
+    plot_matrix(output / "write-matrix.png", summary, groups, setup["compare_hdf5_alignment"])
     raw = setup["raw"]
     filesystem = setup["destination_mount"].get("fstype", "unknown")
     scratch = setup["source_mount"].get("fstype", "unknown")
@@ -231,6 +263,14 @@ def report(output, setup, summary):
                       "File cases have HDF5 build the part directly in a temporary file on the destination mount. "
                       "Both use the same rename and publication marker protocol. "
                       "For file cases, `write_seconds` includes building the HDF5 part.", ""]
+    elif setup["compare_hdf5_alignment"]:
+        comparison = [f"Default cases use HDF5's usual file layout. Aligned cases set the HDF5 alignment interval "
+                      f"to {setup['hdf5_alignment_mib']:g} MiB, or to the chunk size when the chunk evenly divides it. "
+                      "Only objects at least that large are aligned, so metadata keeps its usual placement. "
+                      "Memory cases build the part with HDF5's core driver and hand it to the filesystem in one "
+                      "write from offset 0, so alignment there mainly affects later chunk reads. File cases have "
+                      "HDF5 write each chunk at its own offset, so alignment also changes the write requests. "
+                      "Memory cases write the gap before the first chunk as zeros. File cases leave it as a hole.", ""]
     elif setup["compare_zarr_writes"]:
         comparison = ["Memory cases build each Zarr shard in a separate memory store. "
                       "File cases assign complete shards to the destination Zarr array. "
@@ -243,6 +283,7 @@ def report(output, setup, summary):
              f"{compression}, fsync {sync}, "
              f"{raw['queue_frames']} queued frames. Zarr async concurrency was {setup['zarr_concurrency']}. "
              f"All cases shared the same {len(setup['cpu_affinity'])} logical CPUs. {quality}", "",
+             layout_note(setup), "",
              "Chunk and partition sizes are uncompressed MiB. Each partition becomes one HDF5 part file or Zarr shard "
              "per detector tile. Chunk shapes are angles × detector y × detector x.", "",
              "| Chunk / partition MiB | Frames per partition per tile | Acquisition chunk shape | Bricks chunk shape |",
@@ -262,8 +303,8 @@ def report(output, setup, summary):
              "![Writer scaling and time to last publication](write-matrix.png)", "",
              "| Chunk / partition MiB | Target fps | Writers | Case | Format / layout | Received fps | Published fps | "
              "Useful GB/s | Payload GB/s | Setup-inclusive GB/s | Full-run GB/s | Raw files | Blocked s | P95 ms | "
-             "Setup to first s | Setup to last s | Missing |",
-             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "Setup to first s | Setup to last s | Misaligned chunks | Allocated MiB | Missing |",
+             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for row in summary:
         fmt = "HDF5" if row["format"] == "nexus" else "Zarr"
         latency = row.get("publish_p95_ms", float("nan"))
@@ -273,7 +314,9 @@ def report(output, setup, summary):
                      f"{row['full_run_gb_s']:.3f} | "
                      f"{row['stored_files']:g} | {row['blocked_seconds']:.3f} | {latency:.0f} | "
                      f"{row['setup_to_first_publish_seconds']:.3f} | "
-                     f"{row['setup_to_last_publish_seconds']:.3f} | {row['missing_frames']} |")
+                     f"{row['setup_to_last_publish_seconds']:.3f} | "
+                     f"{row['layout_misaligned_chunks']:g} / {row['layout_chunks']:g} | "
+                     f"{row['raw_allocated_bytes'] / MIB:.1f} | {row['missing_frames']} |")
     gpfs = [row for row in summary if "gpfs_client_write_gb_s" in row]
     if gpfs:
         lines += ["", "## GPFS client write counters", "",
@@ -304,8 +347,14 @@ def main():
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument("--compare-hdf5-writes", action="store_true",
                             help="compare HDF5 memory and file output for both layouts (uncompressed, fsync on)")
+    comparison.add_argument("--compare-hdf5-alignment", action="store_true",
+                            help="compare default and block-aligned HDF5 chunks for both layouts and write paths "
+                                 "(uncompressed, fsync on)")
     comparison.add_argument("--compare-zarr-writes", action="store_true",
                             help="compare Zarr memory and filesystem stores for both layouts (uncompressed, fsync on)")
+    parser.add_argument("--hdf5-alignment", type=int, metavar="MIB",
+                        help="align HDF5 raw chunks to this many MiB (default: HDF5 layout; "
+                             "8 with --compare-hdf5-alignment)")
     parser.add_argument("--no-sync", action="store_true", help="measure buffered writes with fsync disabled")
     parser.add_argument("--rates", type=integer_list, default=(500, 4000), help="comma-separated source rates")
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
@@ -330,12 +379,21 @@ def main():
                 raise ValueError("a verified four-case experiment is required")
             raw = experiment["raw"]
             chunks = {row["case"]: row["raw_chunks"] for row in experiment["case_results"]}
-        if args.compare_hdf5_writes or args.compare_zarr_writes:
+        if args.hdf5_alignment is not None and args.hdf5_alignment < 0:
+            raise ValueError("HDF5 alignment must be zero or a positive MiB count")
+        alignment = args.hdf5_alignment if args.hdf5_alignment is not None else (8 if args.compare_hdf5_alignment else 0)
+        if args.compare_hdf5_alignment and not alignment:
+            raise ValueError("--compare-hdf5-alignment needs a positive --hdf5-alignment")
+        if args.compare_hdf5_writes or args.compare_zarr_writes or args.compare_hdf5_alignment:
             raw = dict(raw, compression="none", sync=True)
+        if args.compare_hdf5_writes or args.compare_zarr_writes:
             selected = ("A", "B") if args.compare_hdf5_writes else ("C", "D")
-            cases = {f"{case}-{path}": (case, path) for case in selected for path in ("memory", "file")}
+            cases = {f"{case}-{path}": (case, path, alignment) for case in selected for path in ("memory", "file")}
+        elif args.compare_hdf5_alignment:
+            cases = {f"{case}-{path}-{name}": (case, path, value) for case in ("A", "B")
+                     for path in ("memory", "file") for name, value in (("default", 0), ("aligned", alignment))}
         else:
-            cases = {case: (case, None) for case in CASES}
+            cases = {case: (case, None, alignment) for case in CASES}
         if args.compression is not None:
             raw = dict(raw, compression=args.compression)
         if args.no_sync:
@@ -360,8 +418,10 @@ def main():
                      raw_chunks=first_geometry["raw_chunks"], geometries=geometries,
                      compare_hdf5_writes=args.compare_hdf5_writes,
                      compare_zarr_writes=args.compare_zarr_writes,
+                     compare_hdf5_alignment=args.compare_hdf5_alignment, hdf5_alignment_mib=alignment,
                      zarr_concurrency=raw.get("zarr_concurrency", zarr.config.get("async.concurrency")),
                      cpu_affinity=sorted(os.sched_getaffinity(0)), repeats=args.repeats)
+        setup["layout_block"] = layout_block(setup["destination_mount"])
         samples, partitions, timeline = [], [], []
         with TemporaryDirectory(prefix="voxel-source-", dir=args.scratch) as source:
             scratch = Path(source)
@@ -381,7 +441,7 @@ def main():
                 for repeat in range(1, args.repeats + 1):
                     order = combinations if repeat % 2 else combinations[::-1]
                     for index, (geometry_label, rate, writers, case_label) in enumerate(order, 1):
-                        case, write_path = cases[case_label]
+                        case, write_path, case_alignment = cases[case_label]
                         kind, layout = CASES[case]
                         hdf5_path = write_path if kind == "nexus" else None
                         zarr_path = write_path if kind == "zarr" else None
@@ -389,18 +449,22 @@ def main():
                         label = f"pass{repeat}-{geometry_label.replace('/', '-')}mib-{rate}fps-{writers}writers-{case_label}"
                         settings = dict(raw, fps=rate, workers=writers, overflow="block",
                                         angle_block=geometry["angle_block"], raw_chunks=geometry["raw_chunks"][case])
+                        if kind == "nexus" and case_alignment:
+                            settings["hdf5_alignment"] = case_alignment * MIB
                         if write_path:
                             path_key = "hdf5_write_path" if kind == "nexus" else "zarr_write_path"
                             settings[path_key] = write_path
                         with TemporaryDirectory(prefix=f"{label}-", dir=output) as target:
                             sample, published, phase = pool.submit(
-                                trial, Path(target), scratch, case, settings, label, args.gpfs_counter_command).result()
+                                trial, Path(target), scratch, case, settings, label, args.gpfs_counter_command,
+                                setup["layout_block"]).result()
                         if layout == "bricks" and raw.get("detector_bricks") == "sinogram":
                             layout = "sinogram"
                         samples.append(dict(trial=label, repeat=repeat, geometry=geometry_label,
                                             chunk_mib=geometry["chunk_mib"], partition_mib=geometry["partition_mib"],
                                             target_fps=rate, writers=writers, case=case_label,
                                             hdf5_write_path=hdf5_path, zarr_write_path=zarr_path,
+                                            hdf5_alignment_mib=case_alignment if kind == "nexus" else None,
                                             format=kind, layout=layout, **sample))
                         partitions.extend(dict(trial=label, **row) for row in published)
                         timeline.append(phase)

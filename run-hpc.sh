@@ -80,6 +80,12 @@ cd -- "$source_dir"
 printf 'Compute node: %s\nPixi: %s\nLocal scratch: %s\n' "$(hostname)" "$pixi" "$scratch"
 if [[ -z $config ]]; then
     printf 'Benchmark output: %s\n' "$output"
+    if [[ -n ${VOXEL_DARSHAN_LIB:-} || -n ${VOXEL_STRACE:-} ]]; then
+        printf 'VOXEL_DARSHAN_LIB and VOXEL_STRACE are only used with --config.\n' >&2
+    fi
+elif [[ -n ${VOXEL_DARSHAN_LIB:-} && ! -f $VOXEL_DARSHAN_LIB ]]; then
+    printf 'VOXEL_DARSHAN_LIB is not a file: %s\n' "$VOXEL_DARSHAN_LIB" >&2
+    exit 2
 fi
 "$pixi" install --locked
 if [[ -n $config ]]; then

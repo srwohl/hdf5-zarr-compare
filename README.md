@@ -246,6 +246,171 @@ the second pass.
 Compare **Full-run GB/s** within C (acquisition chunks) and within D (bricks).
 In `samples.csv`, `write_seconds` includes shard encoding for the file path.
 
+### Diagnose GPFS write behaviour
+
+Three tools show how the writes map onto GPFS blocks and which POSIX calls
+each case makes.
+
+**Recorded automatically in every write matrix.** For the output directory,
+the report records the `stat` block size (`st_blksize`) and the `statvfs`
+sizes. On a `gpfs` mount, it also runs `mmlsfs` with the block size, subblock
+size, inode size, allocation type and replication flags, if your account can
+run it. After each trial, the matrix reads where every chunk was stored:
+HDF5 chunk addresses and the Zarr shard indexes. **Misaligned chunks** counts
+chunks that touch more filesystem blocks than their size needs. The check
+uses the `mmlsfs` block size if available, otherwise `st_blksize`.
+**Allocated MiB** is the space the raw files occupy on disk.
+
+With HDF5's default layout, the first chunk starts a few KiB into the file.
+Every uncompressed 8 MiB chunk then crosses two 8 MiB GPFS blocks.
+Uncompressed Zarr shards start at byte 0 and store their index at the end, so
+their chunks line up. With gzip, chunks in both formats have variable sizes
+and can't be aligned.
+
+#### Compare default and aligned HDF5 chunks
+
+```bash
+./run-hpc.sh --config configs/hdf5-alignment.toml
+```
+
+This runs A and B with HDF5's default layout and again with chunks aligned
+to 8 MiB, through both the memory and file write paths. It uses uncompressed
+data, fsync, and the 8:32, 8:128 and 2:128 geometries. The memory path hands
+each finished part to the filesystem in one write starting at offset 0. For
+that path, alignment mainly changes how later chunk reads fall on blocks. The
+file path has HDF5 write each chunk at its own offset, so alignment also
+changes the write requests that GPFS receives. A chunk that evenly divides 8 MiB is aligned to its own size.
+For example, 2 MiB chunks pack four to a block. Only chunk-sized objects are
+aligned, and HDF5 metadata keeps its default placement. Each aligned file
+starts with up to one block of space before the first chunk. The memory path
+writes that space as zeros, while the file path leaves a hole. Compare
+**Allocated MiB** to see the cost.
+
+The comparison is valid if **Misaligned chunks** drops to 0 in the aligned
+cases. Then compare **Full-run GB/s** and **P95 ms** within each layout.
+Set `hdf5-alignment` to your filesystem's block size if it isn't 8 MiB.
+To align HDF5 in any other write-matrix config, add `hdf5-alignment = 8`
+to its `[options]`.
+
+You can check stored data from any saved run directly. Pass a `raw-nexus`
+or `raw.zarr` directory:
+
+```bash
+pixi run python chunk_layout.py data/beamline-comparison/A/raw-nexus --block 8388608
+```
+
+#### Trace POSIX calls with Darshan
+
+[Darshan](https://www.mcs.anl.gov/research/projects/darshan/) records each
+process's file I/O without code changes. It reports access-size histograms,
+how many accesses were not aligned to the filesystem block, fsync and rename
+counts, and time spent in data and metadata operations. Many HPC centres
+provide it as a module. Point `VOXEL_DARSHAN_LIB` at `libdarshan.so`
+from darshan-runtime and run any config:
+
+```bash
+module load darshan                          # site-specific name
+find ${LD_LIBRARY_PATH//:/ } -name libdarshan.so 2>/dev/null   # or check: module show darshan
+export VOXEL_DARSHAN_LIB=/path/to/libdarshan.so
+./run-hpc.sh --config configs/hdf5-alignment.toml
+```
+
+The launcher preloads Darshan only into the benchmark processes, with
+non-MPI mode enabled. It doesn't instrument Pixi, the local work
+directory, or the Python environment. Logs are written to node-local
+scratch and then moved to `darshan/` in the result directory. If
+`darshan-parser` (from darshan-util) is on `PATH`, the launcher also writes
+`darshan-summary.md` and `darshan-summary.csv`, with one row per trial.
+Rerun the summary later with:
+
+```bash
+pixi run python darshan_summary.py "$GPFS_PROJECT/hdf5-alignment-<stamp>-<id>"
+```
+
+In `darshan-summary.md`:
+
+- **Not aligned**: reads and writes that started off the block size
+  Darshan recorded (shown under **Alignment**).
+- **Mean write MiB** and the write-size columns: whether each format
+  issues a few large writes or many small ones.
+- **Opens**, **fsyncs**, **Renames** and **Meta s**: metadata cost of the
+  publication protocol. Each partition creates a `.partial` file, renames
+  it, syncs the file and its directories, and writes a marker.
+
+The counts include verification rereads after each trial. Writers run in
+parallel, so the time columns can add up to more than the trial's duration.
+For a per-request timeline, also set `VOXEL_DARSHAN_DXT=1` and
+open the logs with `darshan-dxt-parser` or PyDarshan. If no logs appear,
+your site's build may use a fixed log directory. Check `darshan-config
+--log-path` or ask the HPC team.
+
+#### Without Darshan: trace with strace
+
+Darshan isn't on conda-forge. If your site has no Darshan module, set
+`VOXEL_STRACE=1` instead. The launcher runs the benchmark under `strace`,
+which records every file call in every process and thread. It needs a
+`strace` binary on `PATH`. Most compute nodes have one in `/usr/bin`; if not,
+try `module load strace`, or run `pixi add strace` to add it to the locked
+environment.
+
+```bash
+VOXEL_STRACE=1 ./run-hpc.sh --config configs/hdf5-alignment.toml
+```
+
+The result directory gets `strace-summary.md`, `strace-summary.csv` and the
+raw per-thread traces in `strace.tar.gz`. Each row is one trial. The summary
+uses the output directory's `st_blksize` as the block size. It reports:
+
+- writes, mean write size, and writes under 1 MiB;
+- **Unaligned** writes, which start off a block boundary;
+- **Partial-block** writes, which start or end inside a block. On GPFS these
+  can force a read-modify-write.
+- file and directory fsyncs, renames, and creates;
+- time spent in write, fsync (including P95), rename, open and close.
+
+To recompute with another block size, unpack the traces and run
+`pixi run python strace_summary.py RESULT_DIR TRACE_DIR --block 8388608`.
+
+strace stops the process at every traced call, so throughput from a traced
+run is not meaningful. Use it for counts, sizes and offsets, with
+`repeats = 1`, and take timings from an untraced run of the same config.
+If no traces appear, the node may block ptrace. Check
+`/proc/sys/kernel/yama/ptrace_scope`: 0 or 1 works, 3 disables tracing.
+You can set `VOXEL_STRACE` or `VOXEL_DARSHAN_LIB`, but not both.
+
+You can also build Darshan yourself on scratch, for example with
+`spack install darshan-runtime~mpi darshan-util`. Then point
+`VOXEL_DARSHAN_LIB` at the resulting `libdarshan.so`.
+
+#### Storage-side checks with an administrator
+
+These commands need root or GPFS admin rights. Run them while a matrix
+trial is running and match the times against `timeline.json`.
+
+| Command | Shows |
+|---|---|
+| `mmdiag --iohist` | Recent disk I/Os with size and latency. Look for I/Os smaller than a block, which indicate read-modify-write |
+| `mmdiag --waiters` (sampled every second) | Whether writers wait on token or lock traffic (directory or byte-range) or on disks |
+| `mmpmon` `rhist` | Client request size and latency histograms |
+| `mmlsattr -L <part file>` | Storage pool and replication of the written files |
+| `mmlsconfig pagepool maxMBpS` | Client cache size and the client's configured bandwidth setting |
+
+GPFS caches data in each client node's page pool. Read timings on the node
+that wrote the data are warm. Without root, the simplest cold read is from a
+different node.
+
+#### Suggested order
+
+1. Run `detector-uncompressed.toml` and `hdf5-alignment.toml` with Darshan
+   (or a separate strace pass) and the `mmpmon` counter hook. Check
+   **Misaligned chunks** and the **Not aligned** or **Unaligned** column.
+2. If alignment helps, add `hdf5-alignment = 8` to `detector-geometry.toml`
+   and rerun the geometry sweep for all four cases.
+3. Run `writers = [2, 4, 8]` with Darshan while an administrator samples
+   `mmdiag --waiters`. Rising **Meta s** or token waiters as writers increase
+   point to directory contention rather than bandwidth. With strace instead,
+   compare fsync P95 and rename time across writer counts.
+
 ### See how parallel reads overlap
 
 Replay the same recorded detector selections with one and two readers and

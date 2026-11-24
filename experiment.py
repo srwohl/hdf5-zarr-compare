@@ -52,14 +52,56 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+MMLSFS = "/usr/lpp/mmfs/bin/mmlsfs"
+
+
+def helper_environment():
+    """Run helper commands without an I/O profiler preloaded into them."""
+    return {key: value for key, value in os.environ.items() if key != "LD_PRELOAD"}
+
+
+def parse_mmlsfs(text):
+    """Map fieldName to data from `mmlsfs -Y` output using its HEADER row."""
+    fields, values = None, {}
+    for line in text.splitlines():
+        columns = line.split(":")
+        if len(columns) > 2 and columns[2] == "HEADER":
+            fields = {name: index for index, name in enumerate(columns)}
+        elif fields and "fieldName" in fields and "data" in fields and len(columns) > fields["data"]:
+            name, value = columns[fields["fieldName"]], columns[fields["data"]]
+            values[name] = int(value) if value.isdigit() else value
+    return values
+
+
+def storage_scale_settings(device):
+    if not os.access(MMLSFS, os.X_OK):
+        return {}
+    try:
+        result = subprocess.run([MMLSFS, device, "-B", "-f", "-i", "-j", "-m", "-r", "-V", "-Y"],
+                                capture_output=True, text=True, timeout=20, check=True, env=helper_environment())
+        return dict(mmlsfs=parse_mmlsfs(result.stdout))
+    except (OSError, subprocess.SubprocessError) as error:
+        return dict(mmlsfs_error=(getattr(error, "stderr", "") or str(error)).strip()[-500:])
+
+
 def mount_info(path):
+    """Record the mount and the block geometry an application sees at path."""
+    info = {}
     try:
         result = subprocess.run(["findmnt", "--json", "--target", str(path),
                                  "--output", "FSTYPE,SOURCE,TARGET"], capture_output=True, text=True,
-                                timeout=10, check=True)
-        return json.loads(result.stdout)["filesystems"][0]
+                                timeout=10, check=True, env=helper_environment())
+        info.update(json.loads(result.stdout)["filesystems"][0])
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError):
-        return {}
+        pass
+    try:
+        stats = os.statvfs(path)
+        info.update(st_blksize=os.stat(path).st_blksize, f_bsize=stats.f_bsize, f_frsize=stats.f_frsize)
+    except OSError:
+        pass
+    if info.get("fstype") == "gpfs" and info.get("source"):
+        info.update(storage_scale_settings(info["source"].split("/")[-1]))
+    return info
 
 
 class Timeline:
@@ -72,7 +114,8 @@ class Timeline:
         if self.command:
             started = time.perf_counter()
             try:
-                output = subprocess.run(self.command, check=True, capture_output=True, text=True, timeout=10)
+                output = subprocess.run(self.command, check=True, capture_output=True, text=True, timeout=10,
+                                        env=helper_environment())
                 counters = json.loads(output.stdout)
                 if not isinstance(counters, dict) or not counters or not all(
                         type(value) in (int, float) and math.isfinite(value) for value in counters.values()):

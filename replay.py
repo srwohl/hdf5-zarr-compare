@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 import zarr
 
+from chunk_layout import hdf5_alignment
 import demo
 import tiled
 from io_workers import pool_for, start_workers
@@ -53,6 +54,7 @@ class RawWriter:
         self.compression = config["compression"]
         path_key = "hdf5_write_path" if kind == "nexus" else "zarr_write_path"
         self.write_path = config.get(path_key, "memory")
+        self.hdf5_options = hdf5_alignment(config.get("hdf5_alignment", 0), self.chunks)
         self.publications = directory / "publications"
         self.publications.mkdir()
         if kind == "nexus":
@@ -100,7 +102,7 @@ class RawWriter:
             path = self.zarr_shard_path(tile, start)
             return path, None if buffer is None else buffer.as_buffer_like()
         path = self.nexus_part_path(tile, start)
-        with h5py.File(str(path), "w", driver="core", backing_store=False) as handle:
+        with h5py.File(str(path), "w", driver="core", backing_store=False, **self.hdf5_options) as handle:
             self.write_nexus_dataset(handle, values)
             handle.flush()
             return path, handle.id.get_file_image()
@@ -123,7 +125,7 @@ class RawWriter:
     def write_nexus_file(self, path, values):
         started = time.perf_counter()
         temporary = path.with_suffix(path.suffix + ".partial")
-        with h5py.File(temporary, "w") as handle:
+        with h5py.File(temporary, "w", **self.hdf5_options) as handle:
             self.write_nexus_dataset(handle, values)
         size = temporary.stat().st_size
         written = time.perf_counter()

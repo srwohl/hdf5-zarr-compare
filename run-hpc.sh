@@ -3,6 +3,7 @@ set -euo pipefail
 
 usage() {
     printf 'Usage: %s OUTPUT_DIRECTORY [LOCAL_WORK_DIRECTORY]\n' "${0##*/}"
+    printf '       %s OUTPUT_DIRECTORY LOCAL_WORK_DIRECTORY --detector-size PIXELS [MATRIX_OPTIONS]\n' "${0##*/}"
     printf 'Run the GPFS benchmark with detector staging on node-local scratch.\n'
 }
 
@@ -10,7 +11,7 @@ if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     exit 0
 fi
-if (( $# < 1 || $# > 2 )); then
+if (( $# < 1 )) || { (( $# > 2 )) && [[ $3 != --detector-size && $3 != --detector-size=* ]]; }; then
     usage >&2
     exit 2
 fi
@@ -63,4 +64,8 @@ cd -- "$source_dir"
 printf 'Compute node: %s\nPixi: %s\nLocal scratch: %s\nBenchmark output: %s\n' \
     "$(hostname)" "$pixi" "$scratch" "$output"
 "$pixi" install --locked
-"$pixi" run --locked experiment "$output" --profile gpfs --scratch "$scratch"
+if (( $# > 2 )); then
+    "$pixi" run --locked write-matrix "$output" --scratch "$scratch" "${@:3}"
+else
+    "$pixi" run --locked experiment "$output" --profile gpfs --scratch "$scratch"
+fi

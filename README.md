@@ -141,6 +141,23 @@ pixi run write-matrix data/parallel-gpfs-preset /gpfs/project/write-matrix \
   --scratch /local/scratch --gpfs-counter-command 'python gpfs_snapshot.py gpfs1'
 ```
 
+### Collect detector-sized write measurements
+
+Run the same four HDF5 and Zarr cases with synthetic 2048 × 2048 uint16 frames
+and Poisson noise. Each frame is 8 MiB uncompressed, so 500 frames/s offers
+4.19 GB/s. The command stages one set of 256 frames (2 GiB plus calibration)
+on local scratch before timing and skips reconstruction. All four cases
+replay and verify the same pixels, with gzip and fsync enabled.
+
+```bash
+./run-hpc.sh "$GPFS_PROJECT/detector-2048-$(date -u +%Y%m%dT%H%M%SZ)" "$VOXEL_WORK" \
+  --detector-size 2048 --frames 256 --rates 500 --writers 2 --repeats 1
+```
+
+Open the output `report.md` for received, published, and compressed payload
+GB/s. Increase `--frames` in multiples of four for longer runs. The synthetic
+mode takes a square detector size in pixels, with an even width.
+
 ### See how parallel reads overlap
 
 Replay the same recorded detector selections with one and two readers and

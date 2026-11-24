@@ -1,9 +1,10 @@
-"""Measure acquisition writes against the same stored detector data."""
+"""Measure acquisition writes against the same stored or synthetic detector data."""
 import argparse
 import itertools
 import json
 import os
 from pathlib import Path
+from shutil import disk_usage
 from statistics import median
 from tempfile import TemporaryDirectory
 import time
@@ -44,6 +45,42 @@ def stage_frames(directory, scratch, raw):
                 selection = (slice(first, stop), slice(0, width), slice(0, width))
                 pixels[selection] = read(tile, selection, "matrix_source")
             pixels.flush()
+
+
+def synthetic_config(width, frames):
+    block = 4
+    if width < 2 or width % 2:
+        raise ValueError("detector size must be a positive even pixel count")
+    if frames < block or frames % block:
+        raise ValueError(f"frame count must be a positive multiple of {block}")
+    raw = dict(size=width, tile=width, tile_origins_yx_px=[(0, 0)],
+               angles_deg=np.linspace(0, 180, frames, endpoint=False).tolist(),
+               angle_block=block, compression="gzip", sync=True, queue_frames=16,
+               zarr_concurrency=4, seed=42, photons=20000, dark=100)
+    chunks = {case: (1, width, width) if layout == "acquisition" else (block, width // 2, width // 2)
+              for case, (_, layout) in CASES.items()}
+    return raw, chunks
+
+
+def stage_synthetic(scratch, raw):
+    width, count = raw["tile"], len(raw["angles_deg"])
+    required = (count * 2 + 8) * width**2 + 4096
+    free = disk_usage(scratch).free
+    if required > free:
+        raise ValueError(f"detector source needs {required / (1 << 30):.2f} GiB on scratch, "
+                         f"with {free / (1 << 30):.2f} GiB available at {scratch.parent}")
+    flat = np.full((width, width), raw["photons"] + raw["dark"], dtype="<f4")
+    dark = np.full((width, width), raw["dark"], dtype="<f4")
+    np.save(scratch / "flat_0.npy", flat)
+    np.save(scratch / "dark_0.npy", dark)
+    axis = np.linspace(-1, 1, width, dtype=np.float32)
+    expected = flat - .6 * raw["photons"] * np.exp(-6 * (axis[:, None]**2 + axis**2))
+    pixels = np.lib.format.open_memmap(scratch / "tile_0.npy", mode="w+", dtype="<u2",
+                                       shape=(count, width, width))
+    rng = np.random.default_rng(raw["seed"])
+    for index in range(count):
+        pixels[index] = rng.poisson(expected)
+    pixels.flush()
 
 
 def trial_throughput(stats, phase):
@@ -132,8 +169,12 @@ def report(output, setup, summary):
     sync = "on" if raw["sync"] else "off"
     quality = "Every trial was reread and matched the source." if setup["verified"] else "At least one trial was incomplete."
     chunk_shapes = " · ".join(f"{case} {' × '.join(map(str, shape))}" for case, shape in setup["raw_chunks"].items())
+    width = raw["tile"]
+    frames = len(raw["angles_deg"]) * len(raw["tile_origins_yx_px"])
+    source = "synthetic counts with Poisson noise" if setup["baseline"] is None else "saved detector replay"
+    passes = "1 pass" if setup["repeats"] == 1 else f"{setup['repeats']} passes"
     lines = ["# Detector write matrix", "",
-             f"{setup['repeats']} passes at each setting, with a fresh process and fresh output per trial. "
+             f"{passes} at each setting, with a fresh process and fresh output per trial. "
              f"Destination was **{filesystem}**, staged source **{scratch}**. "
              f"{raw['compression']} compression, fsync {sync}, {raw['angle_block']} angles per file or shard, "
              f"{raw['queue_frames']} queued frames. Zarr async concurrency was {setup['zarr_concurrency']}. "
@@ -142,7 +183,8 @@ def report(output, setup, summary):
              "The replay source pauses when the bounded queue fills. Sustained received rate and blocked time "
              "show how closely the writer kept up with the configured source rate. "
              "The setup-to-last clock starts before initializing the writer and ends at the last visible marker.", "",
-             f"One frame contains {raw['tile'] ** 2 * 2:,} uncompressed detector bytes. GB/s uses decimal gigabytes. "
+             f"Each trial replays {frames:,} uint16 frames of {width} × {width} pixels from {source}. "
+             f"One frame contains {width**2 * 2:,} uncompressed detector bytes. GB/s uses decimal gigabytes. "
              "Useful GB/s counts the original bytes in published frames. Payload GB/s counts the HDF5 part file "
              "or Zarr shard bytes handed to the filesystem during replay. Setup-inclusive GB/s counts useful "
              "bytes from writer setup through last publication.", "",
@@ -178,8 +220,10 @@ def report(output, setup, summary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("directory", type=Path, help="verified experiment with its original detector data")
+    parser.add_argument("directory", type=Path, nargs="?", help="verified experiment with its original detector data")
     parser.add_argument("output", type=Path, help="new write matrix directory on the filesystem under test")
+    parser.add_argument("--detector-size", type=int, metavar="PIXELS", help="synthetic square detector width in pixels")
+    parser.add_argument("--frames", type=int, help="synthetic frame count (default: 256, multiple of 4)")
     parser.add_argument("--rates", type=integer_list, default=(500, 4000), help="comma-separated source rates")
     parser.add_argument("--writers", type=integer_list, default=(1, 2), help="comma-separated writer counts")
     parser.add_argument("--repeats", type=int, default=2)
@@ -189,12 +233,19 @@ def main():
     try:
         if args.repeats < 1:
             raise ValueError("repeats must be positive")
-        directory = args.directory.resolve()
-        experiment = json.loads((directory / "experiment.json").read_text())
-        if not experiment["verified"]:
-            raise ValueError("a verified four-case experiment is required")
-        records = {row["case"]: row for row in experiment["case_results"]}
-        raw = experiment["raw"]
+        if (args.directory is None) == (args.detector_size is None):
+            raise ValueError("provide either a verified experiment directory or --detector-size")
+        directory = args.directory.resolve() if args.directory else None
+        if directory is None:
+            raw, chunks = synthetic_config(args.detector_size, args.frames if args.frames is not None else 256)
+        else:
+            if args.frames is not None:
+                raise ValueError("--frames requires --detector-size")
+            experiment = json.loads((directory / "experiment.json").read_text())
+            if not experiment["verified"]:
+                raise ValueError("a verified four-case experiment is required")
+            raw = experiment["raw"]
+            chunks = {row["case"]: row["raw_chunks"] for row in experiment["case_results"]}
         if max(args.writers) > len(raw["angles_deg"]) // raw["angle_block"]:
             raise ValueError("writer count exceeds available angle blocks")
         if args.scratch:
@@ -202,22 +253,24 @@ def main():
         output = args.output.resolve()
         output.mkdir(parents=True, exist_ok=False)
         combinations = list(itertools.product(args.rates, args.writers, CASES))
-        setup = dict(baseline=str(directory), destination_mount=mount_info(output), raw=raw,
-                     raw_chunks={case: records[case]["raw_chunks"] for case in CASES},
+        setup = dict(baseline=str(directory) if directory else None, destination_mount=mount_info(output), raw=raw,
+                     raw_chunks=chunks,
                      zarr_concurrency=raw.get("zarr_concurrency", zarr.config.get("async.concurrency")),
                      cpu_affinity=sorted(os.sched_getaffinity(0)), repeats=args.repeats)
         samples, partitions, timeline = [], [], []
         with TemporaryDirectory(prefix="voxel-source-", dir=args.scratch) as source:
             scratch = Path(source)
             setup["source_mount"] = mount_info(scratch)
-            stage_frames(directory, scratch, raw)
+            if directory is None:
+                stage_synthetic(scratch, raw)
+            else:
+                stage_frames(directory, scratch, raw)
             with fresh_trial_pool() as pool:
                 for repeat in range(1, args.repeats + 1):
                     order = combinations if repeat % 2 else combinations[::-1]
                     for index, (rate, writers, case) in enumerate(order, 1):
                         label = f"pass{repeat}-{rate}fps-{writers}writers-{case}"
-                        settings = dict(raw, fps=rate, workers=writers, overflow="block",
-                                        raw_chunks=records[case]["raw_chunks"])
+                        settings = dict(raw, fps=rate, workers=writers, overflow="block", raw_chunks=chunks[case])
                         with TemporaryDirectory(prefix=f"{label}-", dir=output) as target:
                             sample, published, phase = pool.submit(
                                 trial, Path(target), scratch, case, settings, label, args.gpfs_counter_command).result()
